@@ -1,0 +1,13 @@
+{
+	"name": "ti-harness",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"start": "node src/main.ts",
+		"ti": "node src/main.ts"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	}
+}
