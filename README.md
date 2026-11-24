@@ -15,6 +15,10 @@ npm start
 - `/login` 保存 DeepSeek API Key，输入时隐藏
 - `/new` 创建会话
 - `/resume` 用方向键选择会话并回车恢复
+- `/retry` 从当前会话重试最后一个失败、中止或尚未回复的问题
+- `/usage` 查看最近回复和会话累计的实报用量，以及当前上下文估算
+- `/compact` 把早期对话压缩成摘要，保留最近对话原文
+- TTY 空输入时用 ↑ / ↓ 翻看历史，生成或压缩期间按 Esc 停止当前操作
 - TTY 输入中按 Ctrl+J 换行
 - `/exit` 或 Ctrl+C 退出
 
@@ -22,6 +26,8 @@ npm start
 
 ## 执行路径
 
-TTY 模式下，`src/terminal-chat.ts` 使用 Node 原始按键输入和 ANSI 绘制全屏对话视口，采用 Pi 的用户消息蓝底、助手 Markdown、固定输入区和目录/模型页脚。非 TTY 输入保留 readline 行模式。界面调用 `src/agent.ts`，后者追加用户消息并请求 `src/deepseek.ts`。DeepSeek 模块用 fetch 解析 SSE，消息由 `src/sessions.ts` 写入 JSONL。
+TTY 使用 Node 原始按键和 ANSI 绘制全屏对话，非 TTY 使用 readline。两个入口共用 `ChatSession`，由它管理当前会话和运行状态。发送时先保存用户消息，再构造模型上下文，DeepSeek 适配器解析 SSE 并返回完整的助手消息。已有问题重试时直接从当前上下文生成。
 
-Ti 使用独立的线性会话记录，不解析 Pi 的压缩、分支编辑和扩展条目，也不复用 Pi 的 auth.json 解析、请求运行时或 TUI 组件。
+Ti 在发请求前检查上下文预算，超出预算时先尝试压缩。JSONL 保留完整对话，并追加摘要和保留边界。之后的请求以及重启恢复都从同一边界构造「摘要 + 近期原文」。缓存命中量由 DeepSeek 上报，仍计入上下文占用。缺失的命中量显示为未知。
+
+运行回归测试可用 `node --test test/chat.test.ts`。测试使用模拟响应和临时会话目录。

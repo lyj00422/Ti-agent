@@ -1,5 +1,9 @@
 # Ti 工作交接
 
+## 当前进度
+
+2026-11-24 完成纯文本聊天阶段。TTY 和 readline 共用会话层，支持流式聊天、会话恢复、失败后重试、用量查询和上下文压缩。下一阶段接入第一个工具和聊天系统提示词。收到工具调用时，下一阶段需要保存助手的调用记录、追加带对应调用 ID 的工具结果，再从已有上下文继续生成。
+
 ## 项目边界
 
 Ti 是独立 harness。当前运行时没有 Pi npm 依赖，也不调用 Pi CLI。对话轮次、DeepSeek HTTP/SSE、凭据存取、线性 JSONL 会话和 readline 交互都由 Ti 自己实现。
@@ -8,9 +12,13 @@ Ti 保留既有项目需求：DeepSeek `deepseek-flash`、流式对话、会话�
 
 ## 调用路径
 
-`terminal-chat.ts` 收到一行文本并调用 main 提供的 send。入口调用 `runAgentTurn`。Agent 先持久化 user 消息，再调用 `streamReply`。DeepSeek SSE 的文本增量显示在终端。最终 assistant 消息追加到当前 JSONL。
+`main.ts` 把 DeepSeek 的流式生成函数注入 `ChatSession`。TTY 和 readline 都使用该会话层的发送、重试、切换和压缩入口。会话层持有本次操作的中止信号。普通发送先写入用户消息，重试直接复用历史，再由同一条生成路径构造上下文、发送请求和保存助手消息。
 
-`SessionStore` 新建 Ti v3 格式的线性 JSONL。它能读取原 Pi v3 普通线性聊天记录。历史记录只载入 Agent 内存，发送时仅追加新消息一次。旧目录只读兼容，迁入 Ti 目录后才写入。
+`agent.ts` 定义内容块、模型流事件和最终助手消息。DeepSeek 适配器向终端传递文本和用量事件，最终返回文本块、结束原因、可选用量和错误。
+
+`SessionStore` 读写 Ti v3 线性 JSONL，也能读取原 Pi v3 的普通文本聊天记录。旧目录会话在首次写入时复制到主目录。压缩记录保存摘要、`firstKeptEntryId`、压缩前 token 估算和可用的摘要请求用量。恢复从最新压缩记录重建模型上下文，显示仍使用完整历史。
+
+上下文估算优先使用压缩后最近一次有效的实际用量，再估算后续消息。缺少基准时按文本 UTF-8 长度近似。模型窗口采用本地 Pi 对 `deepseek-flash` 的 100 万 token 配置。Ti 为普通回复预留并限制 16,384 token，保留近期原文的目标是 20,000 token，摘要输出上限为 4,096 token。手动 `/compact` 和发送前自动压缩共用流程。API 明确报告上下文超限时，`/retry` 先尝试压缩再复用原问题。失败、截断或无效摘要不会启用新边界，已上报的摘要用量仍计入累计。
 
 ## 数据目录
 
@@ -20,11 +28,14 @@ Ti 保留既有项目需求：DeepSeek `deepseek-flash`、流式对话、会话�
 
 ## 能力边界
 
-- Agent 只处理文本消息，拒绝工具调用响应。
-- 会话是线性的，不保留 Pi 的分支选择、压缩、上下文编辑、usage 或扩展状态。
-- TTY 使用 Node 原始按键和 ANSI 绘制 Pi 风格全屏界面，包括用户消息底色、助手 Markdown、固定编辑区、状态和页脚。非 TTY 保留 readline 行模式。
-- 当前包依赖为空，lockfile 只包含项目元数据。
+- 当前范围是单模型、线性纯文本聊天。工具和聊天系统提示词留到下一阶段。
+- TTY 支持 Esc 停止，Ctrl+C 退出并等待当前操作收尾。readline 同样支持 `/retry`、`/usage` 和 `/compact`。
+- 用量统计以 API 实报为准。会话累计包含摘要请求，模型上下文估算只计算本轮投影。
 
 ## 验证
 
-本轮聚焦 TTY 界面，使用 mock fetch 确认全屏视图、流式回复、`/new`、方向键 `/resume`、隐藏式 `/login` 和 `/exit`。Node 语法检查通过。没有改动消息请求或会话存储逻辑。
+`node --test test/chat.test.ts` 的 9 项回归测试覆盖 SSE 文本和用量、请求错误、重启重试、压缩与恢复、旧会话迁入、CLI 和 TTY 操作。测试使用模拟 DeepSeek 响应和临时会话目录，并用小上下文窗口触发自动压缩。
+
+手动体验时，用 `npm start` 启动 Ti，聊几轮后执行 `/usage` 查看实报用量和上下文估算，再用 `/compact` 压缩早期对话。重启后继续当前会话，可以在 JSONL 中查看完整消息和追加的压缩记录。
+
+本地 Pi 对照入口为 `packages/agent/src/agent-loop.ts` 中的继续生成，`packages/ai/src/api/openai-completions.ts` 中的流式用量解析，以及 `packages/coding-agent/src/core/compaction/compaction.ts` 中的上下文估算与压缩。

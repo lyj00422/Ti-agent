@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { appendFileSync, constants, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import type { ChatMessage } from "./agent.ts";
+import { messageText } from "./agent.ts";
+import type { AssistantMessage, ChatMessage, TextContent, Usage } from "./agent.ts";
 
 interface SessionHeader {
 	type: "session";
@@ -16,18 +17,36 @@ interface Entry {
 	id: string;
 	parentId: string | null;
 	name?: string;
+	summary?: string;
+	firstKeptEntryId?: string;
+	tokensBefore?: number;
+	usage?: StoredUsage;
 	message?: {
 		role: string;
 		content: string | Array<{ type: string; text?: string }>;
 		timestamp: number;
-		stopReason?: ChatMessage["stopReason"];
+		stopReason?: AssistantMessage["stopReason"];
+		usage?: StoredUsage;
+		error?: AssistantMessage["error"];
 		errorMessage?: string;
 	};
 }
 
+type StoredUsage = Usage & { totalTokens?: number; cacheWrite?: number };
+type StoredMessage = ChatMessage & { id: string };
+
+export interface Compaction {
+	summary: string;
+	firstKeptEntryId: string;
+	tokensBefore: number;
+	usage?: Usage;
+}
+
 export interface Session {
 	path: string;
-	history: ChatMessage[];
+	history: StoredMessage[];
+	compactions: Array<Compaction & { historyLength: number }>;
+	failedCompactionUsage: Usage[];
 	title: string;
 	modified: Date;
 	leafId: string | null;
@@ -55,6 +74,8 @@ export class SessionStore {
 		return {
 			path: join(this.directory, file),
 			history: [],
+			compactions: [],
+			failedCompactionUsage: [],
 			title: id,
 			modified: now,
 			leafId: null,
@@ -83,20 +104,24 @@ export class SessionStore {
 
 	append(session: Session, message: ChatMessage): void {
 		const id = randomUUID();
-		const entry = {
-			type: "message",
-			id,
-			parentId: session.leafId,
-			timestamp: new Date().toISOString(),
-			message: {
-				role: message.role,
-				content: message.text ? [{ type: "text", text: message.text }] : [],
-				timestamp: message.timestamp,
-				stopReason: message.stopReason,
-				errorMessage: message.errorMessage,
-			},
-		};
-		const line = JSON.stringify(entry) + "\n";
+		this.appendEntry(session, { type: "message", id, parentId: session.leafId, message });
+		if (session.history.length === 0 && message.role === "user") session.title = messageText(message);
+		session.history.push({ ...message, id });
+	}
+
+	appendCompaction(session: Session, compaction: Compaction): void {
+		this.appendEntry(session, { ...compaction, type: "compaction", id: randomUUID(), parentId: session.leafId });
+		session.compactions.push({ ...compaction, historyLength: session.history.length });
+	}
+
+	appendCompactionUsage(session: Session, usage: Usage): void {
+		this.appendEntry(session, { type: "compaction_usage", id: randomUUID(), parentId: session.leafId, usage });
+		session.failedCompactionUsage.push(usage);
+	}
+
+	private appendEntry(session: Session, entry: Entry): void {
+		const timestamp = new Date().toISOString();
+		const line = JSON.stringify({ ...entry, timestamp }) + "\n";
 		if (session.initialContents !== undefined) {
 			mkdirSync(this.directory, { recursive: true });
 			writeFileSync(session.path, session.initialContents + line, { flag: "wx" });
@@ -104,10 +129,8 @@ export class SessionStore {
 		} else {
 			appendFileSync(session.path, line, { flag: constants.O_WRONLY | constants.O_APPEND });
 		}
-		if (session.history.length === 0 && message.role === "user") session.title = message.text;
-		session.history.push(message);
-		session.leafId = id;
-		session.modified = new Date(entry.timestamp);
+		session.leafId = entry.id;
+		session.modified = new Date(timestamp);
 	}
 
 	private read(file: string): Session {
@@ -130,26 +153,57 @@ export class SessionStore {
 			latest = entry;
 		}
 
-		const history: ChatMessage[] = [];
+		const chain: Entry[] = [];
 		const visited = new Set<string>();
 		for (let entry = latest; entry; entry = entry.parentId ? entries.get(entry.parentId) : undefined) {
 			if (visited.has(entry.id)) throw new Error(`会话记录存在循环引用 ${basename(file)}`);
 			visited.add(entry.id);
+			chain.push(entry);
+		}
+		const history: Session["history"] = [];
+		const compactions: Session["compactions"] = [];
+		const failedCompactionUsage: Usage[] = [];
+		const messageIds = new Set<string>();
+		for (const entry of chain.reverse()) {
+			if (entry.type === "compaction_usage" && entry.usage) failedCompactionUsage.push(entry.usage);
+			if (entry.type === "compaction" && typeof entry.summary === "string" && entry.firstKeptEntryId
+				&& messageIds.has(entry.firstKeptEntryId) && typeof entry.tokensBefore === "number") {
+				compactions.push({
+					summary: entry.summary, firstKeptEntryId: entry.firstKeptEntryId, tokensBefore: entry.tokensBefore,
+					usage: readUsage(entry.usage), historyLength: history.length,
+				});
+			}
 			const message = entry.type === "message" ? entry.message : undefined;
 			if (message?.role !== "user" && message?.role !== "assistant") continue;
-			const text = typeof message.content === "string" ? message.content
-				: message.content.filter((block) => block.type === "text").map((block) => block.text).join("");
-			const { role, timestamp, stopReason, errorMessage } = message;
-			history.push({ role, text, timestamp, stopReason, errorMessage });
+			const content: TextContent[] = typeof message.content === "string"
+				? [{ type: "text", text: message.content }]
+				: message.content.filter((block): block is TextContent => block.type === "text" && typeof block.text === "string");
+			const { role, timestamp, stopReason, error, errorMessage } = message;
+			const base = { id: entry.id, content, timestamp };
+			history.push(role === "user" ? { ...base, role } :
+				{ ...base, role, stopReason: stopReason ?? "stop", usage: readUsage(message.usage), error, errorMessage });
+			messageIds.add(entry.id);
 		}
-		history.reverse();
+		const firstUser = history.find((message) => message.role === "user");
 		return {
 			path: join(this.directory, basename(file)),
 			history,
-			title: title || history.find((message) => message.role === "user")?.text || header.id,
+			compactions,
+			failedCompactionUsage,
+			title: title || (firstUser && messageText(firstUser)) || header.id,
 			modified: statSync(file).mtime,
 			leafId: latest?.id ?? null,
 			initialContents: dirname(file) === this.directory ? undefined : contents + "\n",
 		};
 	}
+}
+
+function readUsage(usage: StoredUsage | undefined): Usage | undefined {
+	if (!usage) return;
+	// Pi's input count excludes cached input. Ti stores the full prompt count.
+	return {
+		input: usage.totalTokens === undefined ? usage.input : usage.input + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0),
+		output: usage.output,
+		cacheRead: usage.cacheRead,
+	};
 }

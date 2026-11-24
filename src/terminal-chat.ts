@@ -2,12 +2,14 @@ import { stdin, stdout } from "node:process";
 import { createInterface, emitKeypressEvents } from "node:readline";
 import { Writable } from "node:stream";
 import { stripVTControlCharacters, styleText } from "node:util";
-import type { Session, SessionStore } from "./sessions.ts";
+import { errorMessage, messageText } from "./agent.ts";
+import type { AssistantMessage, Usage } from "./agent.ts";
+import type { ChatEvent, ChatSession } from "./chat-session.ts";
+import type { Session } from "./sessions.ts";
 
 interface TerminalChatOptions {
 	model: string;
-	sessions: SessionStore;
-	send: (session: Session, text: string, onDelta: (text: string) => void, signal: AbortSignal) => Promise<void>;
+	session: ChatSession;
 	login: (key: string) => void;
 }
 
@@ -20,7 +22,7 @@ export async function startTerminalChat(options: TerminalChatOptions): Promise<v
 }
 
 async function startReadlineChat(options: TerminalChatOptions): Promise<void> {
-	let session = options.sessions.list()[0] ?? options.sessions.create();
+	const { session } = options;
 	let hidden = false;
 	const terminal = Boolean(stdin.isTTY && stdout.isTTY);
 	const output = new Writable({
@@ -32,9 +34,10 @@ async function startReadlineChat(options: TerminalChatOptions): Promise<void> {
 	Object.defineProperty(output, "columns", { get: () => stdout.columns });
 
 	const input = createInterface({ input: stdin, output, terminal, historySize: 0 });
-	const exiting = new AbortController();
+	let exiting = false;
 	const close = () => {
-		exiting.abort();
+		exiting = true;
+		session.abort();
 		input.close();
 	};
 	input.on("SIGINT", close);
@@ -52,25 +55,48 @@ async function startReadlineChat(options: TerminalChatOptions): Promise<void> {
 	const errorLine = (message: string) => write(styleText("red", display(message)) + "\n");
 	const showHistory = () => {
 		for (const message of session.history) {
-			if (message.text) write(`${message.role === "user" ? "你" : "Ti"}> ${display(message.text)}\n`);
-			if (message.stopReason === "error" && message.errorMessage) {
-				errorLine("请求失败  " + message.errorMessage);
-			}
+			const text = messageText(message);
+			if (text) write(`${message.role === "user" ? "你" : "Ti"}> ${display(text)}\n`);
+			if (message.role === "assistant") showStatus(message);
 		}
 	};
+	const showStatus = (message: AssistantMessage) => {
+		const status = replyStatus(message);
+		if (status) errorLine(status);
+	};
+	const onEvent = (event: ChatEvent) => {
+		if (event.type === "compacting") write("正在压缩早期对话…\n");
+		if (event.type === "compacted") write("上下文已压缩。\n");
+	};
+	const respond = async (text: string, retry: boolean) => {
+		let started = false;
+		const update = (event: ChatEvent) => {
+			if (event.type !== "text_delta") {
+				onEvent(event);
+				return;
+			}
+			if (!started) write("Ti> ");
+			started = true;
+			write(display(event.text));
+		};
+		const reply = await (retry ? session.retry(update) : session.send(text, update)).finally(() => {
+			if (started) write("\n");
+		});
+		showStatus(reply);
+	};
 	const prompt = () => {
-		if (terminal && !hidden && !exiting.signal.aborted) {
+		if (terminal && !hidden && !exiting) {
 			input.setPrompt(picker ? "编号> " : multiline.length ? "… " : "你> ");
 			input.prompt();
 		}
 	};
 
 	try {
-		write(`Ti · ${options.model} · /new 新会话 · /resume 切换 · /login 登录 · /exit 退出\n`);
+		write(`Ti · ${options.model} · /new · /resume · /login · /retry · /usage · /compact · /exit\n`);
 		showHistory();
 		prompt();
 		for await (const line of input) {
-			if (exiting.signal.aborted) break;
+			if (exiting) break;
 			const command = line.trim();
 			if (!loginPending && command === "/exit") break;
 			try {
@@ -86,7 +112,7 @@ async function startReadlineChat(options: TerminalChatOptions): Promise<void> {
 					if (command) {
 						const selected = /^\d+$/.test(command) ? picker[Number(command) - 1] : undefined;
 						if (!selected) throw new Error("请输入列表中的编号，或直接回车取消。");
-						session = selected;
+						session.resume(selected);
 						write("已恢复会话\n");
 						showHistory();
 					}
@@ -96,10 +122,10 @@ async function startReadlineChat(options: TerminalChatOptions): Promise<void> {
 					hidden = true;
 					write("DeepSeek API Key（输入隐藏，直接回车取消）> ");
 				} else if (!multiline.length && command === "/new") {
-					session = options.sessions.create();
+					session.newSession();
 					write("已创建新会话\n");
 				} else if (!multiline.length && command === "/resume") {
-					const sessions = options.sessions.list();
+					const sessions = session.list();
 					if (sessions.length) {
 						picker = sessions;
 						for (const [index, item] of sessions.entries()) {
@@ -110,22 +136,25 @@ async function startReadlineChat(options: TerminalChatOptions): Promise<void> {
 					} else {
 						write("没有可恢复的会话。\n");
 					}
+				} else if (!multiline.length && command === "/usage") {
+					write(formatUsage(session) + "\n");
+				} else if (!multiline.length && command === "/compact") {
+					await session.compact(onEvent);
+				} else if (!multiline.length && command === "/retry") {
+					await respond("", true);
 				} else if (line.endsWith("\\")) {
 					multiline.push(line.slice(0, -1));
 				} else {
 					const text = [...multiline, line].join("\n").trim();
 					multiline = [];
-					if (text) {
-						write("Ti> ");
-						try {
-							await options.send(session, text, (delta) => write(display(delta)), exiting.signal);
-						} finally {
-							write("\n");
-						}
-					}
+					if (text) await respond(text, false);
 				}
 			} catch (error) {
-				if (!exiting.signal.aborted) errorLine("请求失败  " + (error instanceof Error ? error.message : String(error)));
+				if (error instanceof Error && error.name === "AbortError") {
+					if (!exiting) write("已停止。\n");
+				} else {
+					errorLine("请求失败  " + errorMessage(error));
+				}
 			}
 			prompt();
 		}
@@ -136,26 +165,28 @@ async function startReadlineChat(options: TerminalChatOptions): Promise<void> {
 }
 
 async function startPiStyleTerminalChat(options: TerminalChatOptions): Promise<void> {
-	return new Promise((resolve) => {
-		let session = options.sessions.list()[0] ?? options.sessions.create();
+	return new Promise((resolve, reject) => {
+		const { session } = options;
 		let mode: "chat" | "login" | "resume" = "chat";
 		let picker: Session[] = [];
 		let selectedSession = 0;
 		let draft = "";
 		let cursor = 0;
 		let streamText = "";
-		let busy = false;
+		let liveUsage: Usage | undefined;
+		let compacting = false;
 		let notice = "";
 		let noticeIsError = false;
 		let spinnerFrame = 0;
 		let scrollOffset = 0;
+		let maxScrollOffset = 0;
 		let closed = false;
-		const abort = new AbortController();
 		const spinner = ["·", "··", "···", "··"];
 		let previousScreen: string[] | undefined;
 
 		const render = () => {
 			if (closed) return;
+			const busy = session.isRunning;
 			const width = Math.max(24, stdout.columns || 80);
 			const height = Math.max(10, stdout.rows || 24);
 			const lines: string[] = [];
@@ -164,16 +195,16 @@ async function startPiStyleTerminalChat(options: TerminalChatOptions): Promise<v
 
 			const transcript: string[] = [];
 			for (const message of session.history) {
+				const text = messageText(message);
 				if (transcript.length > 0) transcript.push("");
 				if (message.role === "user") {
-					for (const line of wrapTerminalText(message.text, width - 4)) {
+					for (const line of wrapTerminalText(text, width - 4)) {
 						transcript.push(piStyle(["bgBlue", "whiteBright"], padTerminalText(`  ${line}  `, width)));
 					}
-				} else if (message.text) {
-					transcript.push(...renderAssistantText(message.text, width - 2));
-				}
-				if (message.stopReason === "error" && message.errorMessage) {
-					transcript.push(piStyle("red", `  Error: ${safeTerminalText(message.errorMessage)}`));
+				} else {
+					if (text) transcript.push(...renderAssistantText(text, width - 2));
+					const status = replyStatus(message);
+					if (status) transcript.push(...wrapTerminalText(status, width - 2).map((line) => piStyle("red", "  " + line)));
 				}
 			}
 			if (streamText) transcript.push(...renderAssistantText(streamText, width - 2));
@@ -187,7 +218,7 @@ async function startPiStyleTerminalChat(options: TerminalChatOptions): Promise<v
 					transcript.push(`${prefix}${index === selectedSession ? piStyle("magenta", title) : title}  ${detail}`);
 				}
 			}
-			if (notice) transcript.push(piStyle(noticeIsError ? "red" : "dim", `  ${safeTerminalText(notice)}`));
+			if (notice) transcript.push(...wrapTerminalText(notice, width - 2).map((line) => piStyle(noticeIsError ? "red" : "dim", "  " + line)));
 
 			const prompt = mode === "login" ? "Key> " : "› ";
 			const draftLayout = layoutTerminalDraft(draft, cursor, Math.max(1, width - 4), mode === "login");
@@ -196,28 +227,33 @@ async function startPiStyleTerminalChat(options: TerminalChatOptions): Promise<v
 				const prefix = index === 0 ? prompt : "  ";
 				return prefix + line;
 			}).slice(hiddenInputRows);
+			const working = `${spinner[spinnerFrame]} ${compacting ? "Compacting" : "Working"}`;
 			const editorBorder = busy
-				? `${piStyle("magenta", "── ")}${piStyle("dim", `${spinner[spinnerFrame]} Working`)}${piStyle("magenta", ` ${"─".repeat(Math.max(1, width - 14))}`)}`
+				? `${piStyle("magenta", "── ")}${piStyle("dim", working)}${piStyle("magenta", ` ${"─".repeat(width - working.length - 4)}`)}`
 				: piStyle("magenta", "─".repeat(width));
 
-			const footerLeft = piStyle("dim", shortenTerminalText(process.cwd(), Math.max(8, Math.floor(width * 0.55))));
 			const footerRight = piStyle("magenta", options.model);
+			const latest = liveUsage ?? session.history.findLast((message) => message.role === "assistant")?.usage;
+			const usageLine = latest ? `↑${latest.input} ↓${latest.output} cache ${latest.cacheRead ?? "?"}` : process.cwd();
+			const footerLeft = piStyle("dim", shortenTerminalText(usageLine, width - terminalWidth(footerRight) - 1));
 			const footer = `${footerLeft}${" ".repeat(Math.max(1, width - terminalWidth(footerLeft) - terminalWidth(footerRight)))}${footerRight}`;
 			const hints = mode === "login"
 				? "Enter save · Esc cancel"
 				: mode === "resume"
 					? "↑↓ select · Enter resume · Esc cancel"
-					: "/login key · /new session · /resume switch · /exit quit · Ctrl+J newline";
+					: busy ? "Esc stop · Ctrl+C exit" : "/new · /resume · /login · /retry · /usage · /compact · /exit · Ctrl+J newline";
 
 			const transcriptRows = Math.max(1, height - inputRows.length - 5);
-			const transcriptEnd = Math.max(0, transcript.length - scrollOffset);
+			maxScrollOffset = Math.max(0, transcript.length - transcriptRows);
+			scrollOffset = Math.min(scrollOffset, maxScrollOffset);
+			const transcriptEnd = transcript.length - scrollOffset;
 			const visibleTranscript = transcript.slice(Math.max(0, transcriptEnd - transcriptRows), transcriptEnd);
 			lines.push(...Array.from({ length: transcriptRows - visibleTranscript.length }, () => ""));
 			lines.push(...visibleTranscript);
 			lines.push(editorBorder);
 			lines.push(...inputRows);
 			lines.push(footer);
-			lines.push(piStyle("dim", shortenTerminalText(hints, width)));
+			lines.push(piStyle("dim", hints.slice(0, width)));
 			const screen = lines.slice(0, height);
 			while (screen.length < height) screen.push("");
 			const cursorRow = Math.min(height, 4 + transcriptRows + Math.max(0, draftLayout.cursorRow - hiddenInputRows));
@@ -245,7 +281,7 @@ async function startPiStyleTerminalChat(options: TerminalChatOptions): Promise<v
 		const close = () => {
 			if (closed) return;
 			closed = true;
-			abort.abort();
+			session.abort();
 			clearInterval(spinnerTimer);
 			stdin.off("keypress", onKeypress);
 			stdin.off("end", close);
@@ -254,7 +290,10 @@ async function startPiStyleTerminalChat(options: TerminalChatOptions): Promise<v
 			if (stdin.isTTY) stdin.setRawMode(false);
 			stdin.pause();
 			stdout.write("\x1b[?25h\x1b[?1049l");
-			resolve();
+			void session.waitForIdle().then(resolve, (error: unknown) => {
+				if (error instanceof Error && error.name === "AbortError") resolve();
+				else reject(error);
+			});
 		};
 
 		const submit = () => {
@@ -282,8 +321,9 @@ async function startPiStyleTerminalChat(options: TerminalChatOptions): Promise<v
 			}
 			if (mode === "resume") {
 				if (picker[selectedSession]) {
-					session = picker[selectedSession];
+					session.resume(picker[selectedSession]);
 				}
+				scrollOffset = 0;
 				setMode("chat");
 				notice = "Session resumed";
 				noticeIsError = false;
@@ -299,7 +339,8 @@ async function startPiStyleTerminalChat(options: TerminalChatOptions): Promise<v
 				return;
 			}
 			if (text === "/new") {
-				session = options.sessions.create();
+				session.newSession();
+				scrollOffset = 0;
 				notice = "New session";
 				noticeIsError = false;
 				draft = "";
@@ -308,7 +349,14 @@ async function startPiStyleTerminalChat(options: TerminalChatOptions): Promise<v
 				return;
 			}
 			if (text === "/resume") {
-				picker = options.sessions.list();
+				try {
+					picker = session.list();
+				} catch (error) {
+					notice = errorMessage(error);
+					noticeIsError = true;
+					render();
+					return;
+				}
 				if (picker.length === 0) {
 					notice = "No sessions to resume";
 					noticeIsError = false;
@@ -316,6 +364,7 @@ async function startPiStyleTerminalChat(options: TerminalChatOptions): Promise<v
 					return;
 				}
 				selectedSession = 0;
+				scrollOffset = 0;
 				setMode("resume");
 				return;
 			}
@@ -323,31 +372,38 @@ async function startPiStyleTerminalChat(options: TerminalChatOptions): Promise<v
 				setMode("login");
 				return;
 			}
-			if (busy) return;
-
 			draft = "";
 			cursor = 0;
-			streamText = "";
-			busy = true;
 			scrollOffset = 0;
 			notice = "";
-			const request = options.send(session, text, (delta) => {
-				streamText += delta;
+			noticeIsError = false;
+			if (text === "/usage") {
+				notice = formatUsage(session);
 				render();
-			}, abort.signal);
+				return;
+			}
+			const onEvent = (event: ChatEvent) => {
+				if (event.type === "text_delta") streamText += event.text;
+				else if (event.type === "usage") liveUsage = event.usage;
+				else if (event.type === "compacting") compacting = true;
+				else {
+					compacting = false;
+					liveUsage = undefined;
+					notice = "上下文已压缩。";
+				}
+				render();
+			};
+			const request = text === "/compact" ? session.compact(onEvent)
+				: text === "/retry" ? session.retry(onEvent)
+					: session.send(text, onEvent);
 			render();
-			void request.then(() => {
-				busy = false;
+			void request.catch((error: unknown) => {
+				notice = error instanceof Error && error.name === "AbortError" ? "已停止。" : errorMessage(error);
+				noticeIsError = notice !== "已停止。";
+			}).finally(() => {
 				streamText = "";
-				render();
-			}).catch((error: unknown) => {
-				busy = false;
-				streamText = "";
-				const assistant = session.history.at(-1);
-				notice = assistant?.role === "assistant" && assistant.stopReason === "error"
-					? ""
-					: error instanceof Error ? error.message : String(error);
-				noticeIsError = Boolean(notice);
+				liveUsage = undefined;
+				compacting = false;
 				render();
 			});
 		};
@@ -358,8 +414,11 @@ async function startPiStyleTerminalChat(options: TerminalChatOptions): Promise<v
 				close();
 				return;
 			}
-			if (busy && mode === "chat") return;
-			if (mode === "resume" && !busy) {
+			if (session.isRunning) {
+				if (key.name === "escape") session.abort();
+				return;
+			}
+			if (mode === "resume") {
 				if (key.name === "escape") {
 					setMode("chat");
 					return;
@@ -390,11 +449,10 @@ async function startPiStyleTerminalChat(options: TerminalChatOptions): Promise<v
 				submit();
 				return;
 			}
-			if (busy) return;
 			if (key.name === "left") cursor = previousCharacterOffset(draft, cursor);
 			else if (key.name === "right") cursor = nextCharacterOffset(draft, cursor);
-			else if ((key.name === "up" || key.name === "down") && draft.length === 0) {
-				scrollOffset = Math.max(0, Math.min(transcript.length, scrollOffset + (key.name === "up" ? 3 : -3)));
+			else if (mode === "chat" && (key.name === "up" || key.name === "down") && draft.length === 0) {
+				scrollOffset = Math.max(0, Math.min(maxScrollOffset, scrollOffset + (key.name === "up" ? 3 : -3)));
 				render();
 				return;
 			} else if (key.name === "up") cursor = moveTerminalCursorVertically(draft, cursor, -1);
@@ -419,7 +477,7 @@ async function startPiStyleTerminalChat(options: TerminalChatOptions): Promise<v
 		};
 
 		const spinnerTimer = setInterval(() => {
-			if (busy) {
+			if (session.isRunning) {
 				spinnerFrame = (spinnerFrame + 1) % spinner.length;
 				render();
 			}
@@ -434,6 +492,25 @@ async function startPiStyleTerminalChat(options: TerminalChatOptions): Promise<v
 		stdout.write("\x1b[?1049h\x1b[?25l");
 		render();
 	});
+}
+
+function replyStatus(message: AssistantMessage): string | undefined {
+	if (message.stopReason === "aborted") return "已停止。可用 /retry 重试。";
+	if (message.stopReason === "length") return "回复达到输出上限，已截断。";
+	if (message.stopReason === "error") {
+		return "请求失败  " + (message.errorMessage ?? message.error?.message ?? "未知错误") + " · /retry";
+	}
+}
+
+function formatUsage(session: ChatSession): string {
+	const { latest, total, cacheReadPartial, contextTokens, contextWindow, inputBudget } = session.usage();
+	const format = ({ input, output, cacheRead }: Usage) => `输入 ${input} · 输出 ${output} · 缓存命中 ${cacheRead ?? "未知"}`;
+	const context = `上下文估算 ${contextTokens} / ${contextWindow} tokens（输入预算 ${inputBudget}）`;
+	return [
+		context,
+		`最近回复  ${latest ? format(latest) : "暂无实报用量"}`,
+		`会话累计（已报告）  ${total ? format(total) : "暂无实报用量"}${cacheReadPartial && total?.cacheRead !== undefined ? "（部分请求未报告缓存）" : ""}`,
+	].join("\n");
 }
 
 function renderAssistantText(text: string, width: number): string[] {
