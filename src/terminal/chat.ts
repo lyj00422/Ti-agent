@@ -2,10 +2,10 @@ import { stdin, stdout } from "node:process";
 import { createInterface, emitKeypressEvents } from "node:readline";
 import { Writable } from "node:stream";
 import { stripVTControlCharacters, styleText } from "node:util";
-import { errorMessage, messageText } from "./agent.ts";
-import type { AssistantMessage, Usage } from "./agent.ts";
-import type { ChatEvent, ChatSession } from "./chat-session.ts";
-import type { Session } from "./sessions.ts";
+import { errorMessage, messageText, toolCalls } from "../agent/messages.ts";
+import type { AssistantMessage, ToolCall, ToolResultMessage, Usage } from "../agent/messages.ts";
+import type { ChatEvent, ChatSession } from "../session/chat-session.ts";
+import type { Session } from "../session/store.ts";
 
 interface TerminalChatOptions {
 	model: string;
@@ -15,7 +15,7 @@ interface TerminalChatOptions {
 
 export async function startTerminalChat(options: TerminalChatOptions): Promise<void> {
 	if (stdin.isTTY && stdout.isTTY) {
-		await startPiStyleTerminalChat(options);
+		await startFullscreenChat(options);
 		return;
 	}
 	await startReadlineChat(options);
@@ -55,9 +55,16 @@ async function startReadlineChat(options: TerminalChatOptions): Promise<void> {
 	const errorLine = (message: string) => write(styleText("red", display(message)) + "\n");
 	const showHistory = () => {
 		for (const message of session.history) {
+			if (message.role === "toolResult") {
+				write(display(toolResultStatus(message)) + "\n");
+				continue;
+			}
 			const text = messageText(message);
 			if (text) write(`${message.role === "user" ? "你" : "Ti"}> ${display(text)}\n`);
-			if (message.role === "assistant") showStatus(message);
+			if (message.role === "assistant") {
+				for (const call of toolCalls(message)) write(display(toolCallLabel(call)) + "\n");
+				showStatus(message);
+			}
 		}
 	};
 	const showStatus = (message: AssistantMessage) => {
@@ -70,7 +77,20 @@ async function startReadlineChat(options: TerminalChatOptions): Promise<void> {
 	};
 	const respond = async (text: string, retry: boolean) => {
 		let started = false;
+		const endText = () => {
+			if (started) write("\n");
+			started = false;
+		};
 		const update = (event: ChatEvent) => {
+			if (event.type === "message_end") {
+				endText();
+				if (event.message.role === "toolResult") write(display(toolResultStatus(event.message)) + "\n");
+				return;
+			}
+			if (event.type === "tool_execution_start") {
+				write(display(toolCallLabel(event.call)) + "\n");
+				return;
+			}
 			if (event.type !== "text_delta") {
 				onEvent(event);
 				return;
@@ -79,9 +99,7 @@ async function startReadlineChat(options: TerminalChatOptions): Promise<void> {
 			started = true;
 			write(display(event.text));
 		};
-		const reply = await (retry ? session.retry(update) : session.send(text, update)).finally(() => {
-			if (started) write("\n");
-		});
+		const reply = await (retry ? session.retry(update) : session.send(text, update)).finally(endText);
 		showStatus(reply);
 	};
 	const prompt = () => {
@@ -164,7 +182,7 @@ async function startReadlineChat(options: TerminalChatOptions): Promise<void> {
 	}
 }
 
-async function startPiStyleTerminalChat(options: TerminalChatOptions): Promise<void> {
+async function startFullscreenChat(options: TerminalChatOptions): Promise<void> {
 	return new Promise((resolve, reject) => {
 		const { session } = options;
 		let mode: "chat" | "login" | "resume" = "chat";
@@ -175,6 +193,7 @@ async function startPiStyleTerminalChat(options: TerminalChatOptions): Promise<v
 		let streamText = "";
 		let liveUsage: Usage | undefined;
 		let compacting = false;
+		let activeTool: ToolCall | undefined;
 		let notice = "";
 		let noticeIsError = false;
 		let spinnerFrame = 0;
@@ -190,8 +209,8 @@ async function startPiStyleTerminalChat(options: TerminalChatOptions): Promise<v
 			const width = Math.max(24, stdout.columns || 80);
 			const height = Math.max(10, stdout.rows || 24);
 			const lines: string[] = [];
-			lines.push(` ${piStyle(["red", "bold"], "T")}${piStyle(["yellow", "bold"], "i")}  ${piStyle("dim", "DeepSeek conversation")}`);
-			lines.push(piStyle("magenta", "─".repeat(width)));
+			lines.push(` ${styleTerminal(["red", "bold"], "T")}${styleTerminal(["yellow", "bold"], "i")}  ${styleTerminal("dim", "DeepSeek conversation")}`);
+			lines.push(styleTerminal("magenta", "─".repeat(width)));
 
 			const transcript: string[] = [];
 			for (const message of session.history) {
@@ -199,26 +218,33 @@ async function startPiStyleTerminalChat(options: TerminalChatOptions): Promise<v
 				if (transcript.length > 0) transcript.push("");
 				if (message.role === "user") {
 					for (const line of wrapTerminalText(text, width - 4)) {
-						transcript.push(piStyle(["bgBlue", "whiteBright"], padTerminalText(`  ${line}  `, width)));
+						transcript.push(styleTerminal(["bgBlue", "whiteBright"], padTerminalText(`  ${line}  `, width)));
 					}
+				} else if (message.role === "toolResult") {
+					transcript.push(...wrapTerminalText(toolResultStatus(message), width - 4)
+						.map((line) => styleTerminal(message.isError ? "red" : "dim", "  " + line)));
 				} else {
 					if (text) transcript.push(...renderAssistantText(text, width - 2));
+					for (const call of toolCalls(message)) {
+						transcript.push(...wrapTerminalText(toolCallLabel(call), width - 4)
+							.map((line) => styleTerminal("magenta", "  " + line)));
+					}
 					const status = replyStatus(message);
-					if (status) transcript.push(...wrapTerminalText(status, width - 2).map((line) => piStyle("red", "  " + line)));
+					if (status) transcript.push(...wrapTerminalText(status, width - 2).map((line) => styleTerminal("red", "  " + line)));
 				}
 			}
 			if (streamText) transcript.push(...renderAssistantText(streamText, width - 2));
 			if (mode === "resume") {
 				transcript.push("");
-				transcript.push(piStyle("yellow", "Resume session"));
+				transcript.push(styleTerminal("yellow", "Resume session"));
 				for (const [index, item] of picker.entries()) {
 					const title = safeTerminalText(item.title).replace(/\s+/g, " ").slice(0, Math.max(8, width - 34));
-					const prefix = index === selectedSession ? piStyle("magenta", "› ") : "  ";
-					const detail = piStyle("dim", `${item.modified.toLocaleString()} · ${item.history.length} messages`);
-					transcript.push(`${prefix}${index === selectedSession ? piStyle("magenta", title) : title}  ${detail}`);
+					const prefix = index === selectedSession ? styleTerminal("magenta", "› ") : "  ";
+					const detail = styleTerminal("dim", `${item.modified.toLocaleString()} · ${item.history.length} messages`);
+					transcript.push(`${prefix}${index === selectedSession ? styleTerminal("magenta", title) : title}  ${detail}`);
 				}
 			}
-			if (notice) transcript.push(...wrapTerminalText(notice, width - 2).map((line) => piStyle(noticeIsError ? "red" : "dim", "  " + line)));
+			if (notice) transcript.push(...wrapTerminalText(notice, width - 2).map((line) => styleTerminal(noticeIsError ? "red" : "dim", "  " + line)));
 
 			const prompt = mode === "login" ? "Key> " : "› ";
 			const draftLayout = layoutTerminalDraft(draft, cursor, Math.max(1, width - 4), mode === "login");
@@ -227,15 +253,15 @@ async function startPiStyleTerminalChat(options: TerminalChatOptions): Promise<v
 				const prefix = index === 0 ? prompt : "  ";
 				return prefix + line;
 			}).slice(hiddenInputRows);
-			const working = `${spinner[spinnerFrame]} ${compacting ? "Compacting" : "Working"}`;
+			const working = `${spinner[spinnerFrame]} ${compacting ? "Compacting" : activeTool ? activeTool.name : "Working"}`;
 			const editorBorder = busy
-				? `${piStyle("magenta", "── ")}${piStyle("dim", working)}${piStyle("magenta", ` ${"─".repeat(width - working.length - 4)}`)}`
-				: piStyle("magenta", "─".repeat(width));
+				? `${styleTerminal("magenta", "── ")}${styleTerminal("dim", working)}${styleTerminal("magenta", ` ${"─".repeat(width - working.length - 4)}`)}`
+				: styleTerminal("magenta", "─".repeat(width));
 
-			const footerRight = piStyle("magenta", options.model);
+			const footerRight = styleTerminal("magenta", options.model);
 			const latest = liveUsage ?? session.history.findLast((message) => message.role === "assistant")?.usage;
 			const usageLine = latest ? `↑${latest.input} ↓${latest.output} cache ${latest.cacheRead ?? "?"}` : process.cwd();
-			const footerLeft = piStyle("dim", shortenTerminalText(usageLine, width - terminalWidth(footerRight) - 1));
+			const footerLeft = styleTerminal("dim", shortenTerminalText(usageLine, width - terminalWidth(footerRight) - 1));
 			const footer = `${footerLeft}${" ".repeat(Math.max(1, width - terminalWidth(footerLeft) - terminalWidth(footerRight)))}${footerRight}`;
 			const hints = mode === "login"
 				? "Enter save · Esc cancel"
@@ -253,7 +279,7 @@ async function startPiStyleTerminalChat(options: TerminalChatOptions): Promise<v
 			lines.push(editorBorder);
 			lines.push(...inputRows);
 			lines.push(footer);
-			lines.push(piStyle("dim", hints.slice(0, width)));
+			lines.push(styleTerminal("dim", hints.slice(0, width)));
 			const screen = lines.slice(0, height);
 			while (screen.length < height) screen.push("");
 			const cursorRow = Math.min(height, 4 + transcriptRows + Math.max(0, draftLayout.cursorRow - hiddenInputRows));
@@ -385,8 +411,12 @@ async function startPiStyleTerminalChat(options: TerminalChatOptions): Promise<v
 			const onEvent = (event: ChatEvent) => {
 				if (event.type === "text_delta") streamText += event.text;
 				else if (event.type === "usage") liveUsage = event.usage;
+				else if (event.type === "message_end") {
+					if (event.message.role === "assistant") streamText = "";
+					if (event.message.role === "toolResult") activeTool = undefined;
+				} else if (event.type === "tool_execution_start") activeTool = event.call;
 				else if (event.type === "compacting") compacting = true;
-				else {
+				else if (event.type === "compacted") {
 					compacting = false;
 					liveUsage = undefined;
 					notice = "上下文已压缩。";
@@ -404,6 +434,7 @@ async function startPiStyleTerminalChat(options: TerminalChatOptions): Promise<v
 				streamText = "";
 				liveUsage = undefined;
 				compacting = false;
+				activeTool = undefined;
 				render();
 			});
 		};
@@ -494,6 +525,18 @@ async function startPiStyleTerminalChat(options: TerminalChatOptions): Promise<v
 	});
 }
 
+function toolCallLabel(call: ToolCall): string {
+	const target = call.arguments.path ?? call.arguments.command ?? call.arguments.pattern;
+	const preview = typeof target === "string" ? target.replace(/\\s+/g, " ").slice(0, 160) : "";
+	return preview ? call.name + " " + preview : call.name;
+}
+
+function toolResultStatus(result: ToolResultMessage): string {
+	const status = result.toolName + (result.isError ? " · 失败" : " · 完成");
+	const detail = result.isError ? messageText(result).trim().slice(0, 320) : "";
+	return detail ? status + "  " + detail : status;
+}
+
 function replyStatus(message: AssistantMessage): string | undefined {
 	if (message.stopReason === "aborted") return "已停止。可用 /retry 重试。";
 	if (message.stopReason === "length") return "回复达到输出上限，已截断。";
@@ -519,24 +562,24 @@ function renderAssistantText(text: string, width: number): string[] {
 	for (const source of text.split("\n")) {
 		if (source.trimStart().startsWith("```")) {
 			inCodeBlock = !inCodeBlock;
-			output.push(piStyle("dim", `  ${"─".repeat(Math.max(1, width - 4))}`));
+			output.push(styleTerminal("dim", `  ${"─".repeat(Math.max(1, width - 4))}`));
 			continue;
 		}
 		if (inCodeBlock) {
-			output.push(...wrapTerminalText(source, width - 4).map((line) => `  ${piStyle("green", line)}`));
+			output.push(...wrapTerminalText(source, width - 4).map((line) => `  ${styleTerminal("green", line)}`));
 			continue;
 		}
 		const heading = source.match(/^\s{0,3}(#{1,3})\s+(.*)$/);
 		const quote = source.match(/^\s{0,3}>\s?(.*)$/);
 		const bullet = source.match(/^\s{0,3}([-*+] |\d+\. )(.*)$/);
 		if (heading) {
-			output.push(...wrapTerminalText(heading[2], width - 2).map((line) => `  ${piStyle(["yellow", "bold"], line)}`));
+			output.push(...wrapTerminalText(heading[2], width - 2).map((line) => `  ${styleTerminal(["yellow", "bold"], line)}`));
 		} else if (quote) {
-			output.push(...wrapTerminalText(quote[1], width - 4).map((line) => `  ${piStyle("dim", `│ ${line}`)}`));
+			output.push(...wrapTerminalText(quote[1], width - 4).map((line) => `  ${styleTerminal("dim", `│ ${line}`)}`));
 		} else if (bullet) {
 			const marker = bullet[1];
 			const parts = wrapTerminalText(bullet[2], width - 4);
-			output.push(`  ${piStyle("magenta", marker)}${styleInlineMarkdown(parts[0] ?? "")}`);
+			output.push(`  ${styleTerminal("magenta", marker)}${styleInlineMarkdown(parts[0] ?? "")}`);
 			for (const line of parts.slice(1)) output.push(`  ${styleInlineMarkdown(line)}`);
 		} else if (source.trim()) {
 			output.push(...wrapTerminalText(source.trim(), width - 2).map((line) => `  ${styleInlineMarkdown(line)}`));
@@ -549,11 +592,11 @@ function renderAssistantText(text: string, width: number): string[] {
 
 function styleInlineMarkdown(text: string): string {
 	return text
-		.replace(/`([^`]+)`/g, (_match, code: string) => piStyle("magenta", code))
-		.replace(/\*\*([^*]+)\*\*/g, (_match, bold: string) => piStyle("bold", bold));
+		.replace(/`([^`]+)`/g, (_match, code: string) => styleTerminal("magenta", code))
+		.replace(/\*\*([^*]+)\*\*/g, (_match, bold: string) => styleTerminal("bold", bold));
 }
 
-function piStyle(styles: string | string[], text: string): string {
+function styleTerminal(styles: string | string[], text: string): string {
 	if (process.env.NO_COLOR !== undefined || process.env.NODE_DISABLE_COLORS !== undefined) return text;
 	const colors: Record<string, string> = {
 		red: "38;2;228;138;122",

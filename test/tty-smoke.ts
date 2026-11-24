@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
+import { mkdirSync } from "node:fs";
 import { stdin, stdout } from "node:process";
-import { messageText } from "../src/agent.ts";
-import type { AssistantMessage, StreamReply } from "../src/agent.ts";
-import { ChatSession } from "../src/chat-session.ts";
-import { SessionStore } from "../src/sessions.ts";
-import { startTerminalChat } from "../src/terminal-chat.ts";
+import { messageText } from "../src/agent/messages.ts";
+import type { AssistantMessage, StreamReply } from "../src/agent/messages.ts";
+import { ChatSession } from "../src/session/chat-session.ts";
+import { SessionStore } from "../src/session/store.ts";
+import { startTerminalChat } from "../src/terminal/chat.ts";
+import { createCoreTools } from "../src/tools/index.ts";
 
 const [, , home, cwd] = process.argv;
+mkdirSync(cwd, { recursive: true });
 const store = new SessionStore(home, [], cwd);
 const previous = store.create();
 const assistant = (text: string, stopReason: AssistantMessage["stopReason"] = "stop"): AssistantMessage =>
@@ -19,6 +22,16 @@ for (let index = 0; index < 12; index++) {
 
 const stream: StreamReply = async (context, { signal, onEvent }) => {
 	assert.equal(signal.aborted, false);
+	if (messageText(context.at(-1)!) === "list") {
+		onEvent({ type: "text_delta", text: "Inspecting" });
+		return { ...assistant("Inspecting", "toolUse"), content: [
+			{ type: "text", text: "Inspecting" }, { type: "toolCall", id: "list-tty", name: "ls", arguments: {} },
+		] };
+	}
+	if (context.at(-1)?.role === "toolResult") {
+		onEvent({ type: "text_delta", text: "Listing finished" });
+		return assistant("Listing finished");
+	}
 	if (messageText(context.at(-1)!) === "wait") {
 		onEvent({ type: "text_delta", text: "visible partial" });
 		await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
@@ -26,7 +39,7 @@ const stream: StreamReply = async (context, { signal, onEvent }) => {
 	}
 	return assistant("next answer");
 };
-const session = new ChatSession(store, { stream, contextWindow: 1_000_000 });
+const session = new ChatSession(store, { stream, contextWindow: 1_000_000, tools: createCoreTools(cwd) });
 let screen = "";
 Object.defineProperties(stdin, { isTTY: { value: true }, setRawMode: { value: () => stdin } });
 Object.defineProperties(stdout, { isTTY: { value: true }, rows: { value: 12 }, columns: { value: 90 } });
@@ -64,6 +77,11 @@ try {
 	send("/resume");
 	key("return");
 	assert.equal(session.history.length, 28);
+	send("list");
+	await session.waitForIdle();
+	assert.match(screen, /ls · 完成/);
+	assert.match(screen, /Listing finished/);
+	assert.equal(session.history.at(-2)?.role, "toolResult");
 } finally {
 	key("c", undefined, true);
 	await cli;

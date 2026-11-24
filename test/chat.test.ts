@@ -6,11 +6,11 @@ import { dirname, join } from "node:path";
 import { test } from "node:test";
 import type { TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
-import { messageText } from "../src/agent.ts";
-import type { AssistantMessage, ModelMessage, StreamReply } from "../src/agent.ts";
-import { ChatSession } from "../src/chat-session.ts";
-import { streamReply } from "../src/deepseek.ts";
-import { SessionStore } from "../src/sessions.ts";
+import { messageText } from "../src/agent/messages.ts";
+import type { AssistantMessage, ModelMessage, StreamReply } from "../src/agent/messages.ts";
+import { ChatSession } from "../src/session/chat-session.ts";
+import { streamReply } from "../src/providers/deepseek.ts";
+import { SessionStore } from "../src/session/store.ts";
 
 function homes(t: TestContext) {
 	const root = mkdtempSync(join(tmpdir(), "ti-chat-test-"));
@@ -144,7 +144,7 @@ test("automatic compaction uses actual usage, persists its boundary, and can be 
 	assert.equal(first.usage().contextTokens, 375);
 	const events: string[] = [];
 	await first.send(recent, (event) => events.push(event.type));
-	assert.deepEqual(events, ["compacting", "compacted"]);
+	assert.deepEqual(events, ["compacting", "compacted", "message_end"]);
 	assert.deepEqual(requests[2], ["Earlier conversation summary (context only):\nA summary.", recent]);
 	assert.equal(first.usage().total?.input, 560);
 	assert.equal(first.usage().total?.cacheRead, 100);
@@ -215,15 +215,18 @@ test("the CLI uses the saved key and resumes the session on restart", (t) => {
 		const body = JSON.parse(String(request.body));
 		const key = new Headers(request.headers).get("authorization");
 		if (key !== "Bearer fake-cli-key") return new Response(null, { status: 401 });
-		const text = body.messages.map((message: { content: string }) => message.content).join(" / ");
+		if (body.messages[0]?.role !== "system" || !body.tools?.some((tool: { function: { name: string } }) => tool.function.name === "read")) {
+			return new Response(null, { status: 400 });
+		}
+		const text = body.messages.slice(1).map((message: { content: string }) => message.content).join(" / ");
 		return new Response("data: " + JSON.stringify({ choices: [{ delta: { content: text } }] }) +
 			'\n\ndata: {"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":4,"prompt_cache_hit_tokens":2}}\n\ndata: [DONE]\n\n');
 	};
 	const preload = "data:text/javascript;base64," + Buffer.from("globalThis.fetch = " + fetchMock.toString()).toString("base64");
-	const run = (input: string) => {
+	const run = (input: string, home = current, legacyHome = "") => {
 		const result = spawnSync(process.execPath, ["--import", preload, main], {
 			cwd, input, encoding: "utf8", timeout: 10_000,
-			env: { ...process.env, DEEPSEEK_API_KEY: "", TI_HOME: current, TI_SESSION_HOME: current, PI_CODING_AGENT_DIR: old },
+			env: { ...process.env, DEEPSEEK_API_KEY: "", TI_HOME: home, TI_SESSION_HOME: home, TI_LEGACY_HOME: legacyHome },
 		});
 		assert.ifError(result.error);
 		assert.equal(result.status, 0, result.stderr);
@@ -238,6 +241,15 @@ test("the CLI uses the saved key and resumes the session on restart", (t) => {
 	assert.match(second, /Ti> third/);
 	const store = new SessionStore(current, [], cwd);
 	assert.deepEqual(store.list().map((session) => session.history.length).sort(), [2, 4]);
+
+	const legacyStore = new SessionStore(old, [], cwd);
+	const legacy = legacyStore.create();
+	legacyStore.append(legacy, { role: "user", content: [{ type: "text", text: "legacy question" }], timestamp: 1 });
+	writeFileSync(join(old, "auth.json"), JSON.stringify({ deepseek: { type: "api_key", key: "fake-cli-key" } }));
+	const imported = join(dirname(current), "imported");
+	assert.match(run("/retry\n/exit\n", imported, old), /Ti> legacy question/);
+	assert.equal(legacyStore.list()[0].history.length, 1);
+	assert.equal(new SessionStore(imported, [], cwd).list()[0].history.length, 2);
 });
 
 test("TTY scrolls history and Escape aborts only the active generation", (t) => {

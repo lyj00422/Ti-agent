@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { appendFileSync, constants, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, constants, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { messageText } from "./agent.ts";
-import type { AssistantMessage, ChatMessage, TextContent, Usage } from "./agent.ts";
+import { messageText } from "../agent/messages.ts";
+import type { AssistantMessage, ChatMessage, ImageContent, TextContent, ToolCall, Usage } from "../agent/messages.ts";
 
 interface SessionHeader {
 	type: "session";
@@ -23,10 +23,14 @@ interface Entry {
 	usage?: StoredUsage;
 	message?: {
 		role: string;
-		content: string | Array<{ type: string; text?: string }>;
+		content: string | StoredBlock[];
 		timestamp: number;
+		toolCallId?: string;
+		toolName?: string;
+		isError?: boolean;
 		stopReason?: AssistantMessage["stopReason"];
 		usage?: StoredUsage;
+		requestOverhead?: number;
 		error?: AssistantMessage["error"];
 		errorMessage?: string;
 	};
@@ -34,6 +38,16 @@ interface Entry {
 
 type StoredUsage = Usage & { totalTokens?: number; cacheWrite?: number };
 type StoredMessage = ChatMessage & { id: string };
+type StoredBlock = {
+	type: string;
+	text?: string;
+	id?: string;
+	name?: string;
+	arguments?: Record<string, unknown>;
+	argumentError?: string;
+	data?: string;
+	mimeType?: string;
+};
 
 export interface Compaction {
 	summary: string;
@@ -124,10 +138,16 @@ export class SessionStore {
 		const line = JSON.stringify({ ...entry, timestamp }) + "\n";
 		if (session.initialContents !== undefined) {
 			mkdirSync(this.directory, { recursive: true });
-			writeFileSync(session.path, session.initialContents + line, { flag: "wx" });
+			writeFileSync(session.path, session.initialContents + line, { flag: "wx", flush: true });
 			session.initialContents = undefined;
 		} else {
-			appendFileSync(session.path, line, { flag: constants.O_WRONLY | constants.O_APPEND });
+			const fd = openSync(session.path, constants.O_WRONLY | constants.O_APPEND);
+			try {
+				writeFileSync(fd, line);
+				fsyncSync(fd);
+			} finally {
+				closeSync(fd);
+			}
 		}
 		session.leafId = entry.id;
 		session.modified = new Date(timestamp);
@@ -174,14 +194,23 @@ export class SessionStore {
 				});
 			}
 			const message = entry.type === "message" ? entry.message : undefined;
-			if (message?.role !== "user" && message?.role !== "assistant") continue;
-			const content: TextContent[] = typeof message.content === "string"
+			if (message?.role !== "user" && message?.role !== "assistant" && message?.role !== "toolResult") continue;
+			const blocks: StoredBlock[] = typeof message.content === "string"
 				? [{ type: "text", text: message.content }]
-				: message.content.filter((block): block is TextContent => block.type === "text" && typeof block.text === "string");
+				: message.content;
 			const { role, timestamp, stopReason, error, errorMessage } = message;
-			const base = { id: entry.id, content, timestamp };
-			history.push(role === "user" ? { ...base, role } :
-				{ ...base, role, stopReason: stopReason ?? "stop", usage: readUsage(message.usage), error, errorMessage });
+			const base = { id: entry.id, timestamp };
+			if (role === "user") {
+				history.push({ ...base, role, content: blocks.filter(isText) });
+			} else if (role === "assistant") {
+				history.push({ ...base, role, content: blocks.filter((block): block is TextContent | ToolCall => isText(block) || isCall(block)),
+					stopReason: stopReason ?? "stop", usage: readUsage(message.usage), requestOverhead: message.requestOverhead, error, errorMessage });
+			} else if (typeof message.toolCallId === "string" && typeof message.toolName === "string") {
+				history.push({ ...base, role, toolCallId: message.toolCallId, toolName: message.toolName,
+					isError: message.isError === true,
+					content: blocks.filter((block): block is TextContent | ImageContent => isText(block) ||
+						(block.type === "image" && typeof block.data === "string" && typeof block.mimeType === "string")) });
+			} else continue;
 			messageIds.add(entry.id);
 		}
 		const firstUser = history.find((message) => message.role === "user");
@@ -198,9 +227,18 @@ export class SessionStore {
 	}
 }
 
+function isText(block: StoredBlock): block is TextContent {
+	return block.type === "text" && typeof block.text === "string";
+}
+
+function isCall(block: StoredBlock): block is ToolCall {
+	return block.type === "toolCall" && typeof block.id === "string" && typeof block.name === "string" &&
+		!!block.arguments && typeof block.arguments === "object" && !Array.isArray(block.arguments);
+}
+
 function readUsage(usage: StoredUsage | undefined): Usage | undefined {
 	if (!usage) return;
-	// Pi's input count excludes cached input. Ti stores the full prompt count.
+	// Legacy usage with totalTokens excludes cached input from input. Ti stores the full prompt count.
 	return {
 		input: usage.totalTokens === undefined ? usage.input : usage.input + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0),
 		output: usage.output,

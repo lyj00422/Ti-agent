@@ -1,33 +1,55 @@
 # Ti
 
-Ti 是独立的终端对话 harness。它用 Node.js 实现对话轮次、DeepSeek 流式请求、JSONL 会话和命令行交互，不依赖 Pi npm 包。当前使用 DeepSeek `deepseek-flash`，不提供工具调用。
+Ti 是一个面向本地代码库的终端编码 harness。它用 DeepSeek `deepseek-flash` 流式处理对话，并在同一轮中查看文件、修改代码、运行检查，再根据结果继续。对话、工具调用和结果保存在可检查的 JSONL 会话里。
 
-## 运行
+## 快速开始
 
-需要 Node.js 22.19 或更新版本。
+需要 Node.js 22.19 或更新版本。在仓库目录运行：
 
 ```sh
+npm ci --ignore-scripts
 npm start
 ```
 
-也可通过全局 `ti` 命令启动。
+启动后用 `/login` 保存 DeepSeek API Key，也可以提前设置 `DEEPSEEK_API_KEY`。在其他项目里使用时，从该项目目录运行 `node /path/to/Ti-agent/src/main.ts`。
 
-- `/login` 保存 DeepSeek API Key，输入时隐藏
-- `/new` 创建会话
-- `/resume` 用方向键选择会话并回车恢复
-- `/retry` 从当前会话重试最后一个失败、中止或尚未回复的问题
-- `/usage` 查看最近回复和会话累计的实报用量，以及当前上下文估算
-- `/compact` 把早期对话压缩成摘要，保留最近对话原文
-- TTY 空输入时用 ↑ / ↓ 翻看历史，生成或压缩期间按 Esc 停止当前操作
-- TTY 输入中按 Ctrl+J 换行
-- `/exit` 或 Ctrl+C 退出
+试试输入「读 README.md，告诉我怎么恢复会话」。终端会显示文件读取状态，随后给出答案。
 
-常见应用会把会话默认放在用户级数据目录，方便跨项目管理；凭据也应留在用户级配置或凭据管理器。Ti 为了让这个学习项目能直接检查 JSONL，特意把会话放在项目 `.ti/sessions/`，并通过 Git 忽略规则排除。API Key 保存在用户目录 `~/.ti/auth.json`，`DEEPSEEK_API_KEY` 环境变量优先。仍可读取用户 Ti 目录和 Pi 配置目录中的会话，恢复后写入项目 `.ti/`。`TI_SESSION_HOME` 可覆盖会话目录，`TI_HOME` 可覆盖凭据目录。
+## 工具
 
-## 执行路径
+| 用途 | 工具 |
+|---|---|
+| 读取、修改和创建文件 | `read` 读取文本或图片，`edit` 精确替换，`write` 创建或覆盖 |
+| 定位代码 | `ls` 列目录，`find` 按 glob 找文件，`grep` 搜文件内容 |
+| 运行检查 | `bash` 运行命令，Windows 上另提供 `powershell` |
 
-TTY 使用 Node 原始按键和 ANSI 绘制全屏对话，非 TTY 使用 readline。两个入口共用 `ChatSession`，由它管理当前会话和运行状态。发送时先保存用户消息，再构造模型上下文，DeepSeek 适配器解析 SSE 并返回完整的助手消息。已有问题重试时直接从当前上下文生成。
+`grep` 和 `find` 分别使用 ripgrep 和 fd。可以通过 PATH 或 `TI_RG_PATH`、`TI_FD_PATH` 提供可执行文件。Windows 上 `bash` 使用 Ubuntu-24.04 WSL，`grep` 在缺少原生 ripgrep 时会使用同一发行版的 `/usr/bin/rg`。文件和 Shell 工具以启动 Ti 的账号权限运行。
 
-Ti 在发请求前检查上下文预算，超出预算时先尝试压缩。JSONL 保留完整对话，并追加摘要和保留边界。之后的请求以及重启恢复都从同一边界构造「摘要 + 近期原文」。缓存命中量由 DeepSeek 上报，仍计入上下文占用。缺失的命中量显示为未知。
+## 会话
 
-运行回归测试可用 `node --test test/chat.test.ts`。测试使用模拟响应和临时会话目录。
+| 命令 | 行为 |
+|---|---|
+| `/new`、`/resume` | 新建会话或从已有会话继续 |
+| `/retry` | 从已保存的消息和工具结果恢复未完成的轮次 |
+| `/compact` | 摘要早期对话，保留完整的近期轮次 |
+| `/usage` | 查看服务端上报的用量和本地上下文估算 |
+| `/exit` | 退出 Ti |
+
+在交互终端按 Esc 停止当前操作，按 Ctrl+J 在输入中换行，空输入时用方向键浏览历史。
+
+会话默认写入项目的 `.ti/sessions/`，凭据默认保存在用户目录的 `~/.ti/auth.json`。`TI_SESSION_HOME` 和 `TI_HOME` 可覆盖对应位置。需要读取旧数据时，将 `TI_LEGACY_HOME` 指向包含旧 `sessions/` 或 `auth.json` 的目录。项目的 `.ti/` 目录已加入 Git 忽略规则。
+
+## 代码结构
+
+- `src/agent/` 定义消息和执行循环。循环先保存工具调用，再执行并保存对应结果，最后把结果交给模型。
+- `src/session/` 管理 JSONL 会话、上下文压缩、中止和重试。
+- `src/tools/` 按文件、搜索、Shell、图片及输出组织工具和配套逻辑，入口负责注册工具。
+- `src/providers/` 处理 DeepSeek 请求和流式响应。`src/terminal/` 提供交互终端和管道输入。
+
+## 验证
+
+```sh
+node --test test/chat.test.ts test/tools.test.ts
+```
+
+测试使用模拟 DeepSeek 响应，并在临时目录中执行本地工具。工具测试需要上述搜索程序和 Shell 环境。
