@@ -28,6 +28,8 @@ interface Entry {
 		toolCallId?: string;
 		toolName?: string;
 		isError?: boolean;
+		details?: unknown;
+		structuredContent?: unknown;
 		stopReason?: AssistantMessage["stopReason"];
 		usage?: StoredUsage;
 		requestOverhead?: number;
@@ -208,6 +210,8 @@ export class SessionStore {
 			} else if (typeof message.toolCallId === "string" && typeof message.toolName === "string") {
 				history.push({ ...base, role, toolCallId: message.toolCallId, toolName: message.toolName,
 					isError: message.isError === true,
+					...(message.details === undefined ? {} : { details: message.details }),
+					...(message.structuredContent === undefined ? {} : { structuredContent: message.structuredContent }),
 					content: blocks.filter((block): block is TextContent | ImageContent => isText(block) ||
 						(block.type === "image" && typeof block.data === "string" && typeof block.mimeType === "string")) });
 			} else continue;

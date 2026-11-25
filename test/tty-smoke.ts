@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { mkdirSync } from "node:fs";
 import { stdin, stdout } from "node:process";
+import { stripVTControlCharacters } from "node:util";
+import { Type } from "typebox";
 import { messageText } from "../src/agent/messages.ts";
 import type { AssistantMessage, StreamReply } from "../src/agent/messages.ts";
 import { ChatSession } from "../src/session/chat-session.ts";
@@ -28,6 +30,11 @@ const stream: StreamReply = async (context, { signal, onEvent }) => {
 			{ type: "text", text: "Inspecting" }, { type: "toolCall", id: "list-tty", name: "ls", arguments: {} },
 		] };
 	}
+	if (messageText(context.at(-1)!) === "progress") {
+		return { ...assistant("", "toolUse"), content: [
+			{ type: "toolCall", id: "progress-tty", name: "progress", arguments: {} },
+		] };
+	}
 	if (context.at(-1)?.role === "toolResult") {
 		onEvent({ type: "text_delta", text: "Listing finished" });
 		return assistant("Listing finished");
@@ -39,7 +46,16 @@ const stream: StreamReply = async (context, { signal, onEvent }) => {
 	}
 	return assistant("next answer");
 };
-const session = new ChatSession(store, { stream, contextWindow: 1_000_000, tools: createCoreTools(cwd) });
+const tools = createCoreTools(cwd);
+tools.register({
+	name: "progress", label: "Progress", description: "Report a long progress line",
+	parameters: Type.Object({}),
+	async execute(_id, _args, _signal, onUpdate) {
+		onUpdate?.({ content: [{ type: "text", text: "进".repeat(105) + " 界面仍在更新" }] });
+		return { content: [{ type: "text", text: "Finished" }] };
+	},
+});
+const session = new ChatSession(store, { stream, contextWindow: 1_000_000, tools });
 let screen = "";
 Object.defineProperties(stdin, { isTTY: { value: true }, setRawMode: { value: () => stdin } });
 Object.defineProperties(stdout, { isTTY: { value: true }, rows: { value: 12 }, columns: { value: 90 } });
@@ -82,6 +98,15 @@ try {
 	assert.match(screen, /ls · 完成/);
 	assert.match(screen, /Listing finished/);
 	assert.equal(session.history.at(-2)?.role, "toolResult");
+	send("progress");
+	await session.waitForIdle();
+	const result = session.history.at(-2);
+	assert.ok(result?.role === "toolResult");
+	assert.equal(result.isError, false, messageText(result));
+	const border = stripVTControlCharacters(screen).match(/── …进+ 界面仍在更新 ─+/)?.[0];
+	assert.ok(border, "The progress border should show the truncated status");
+	const cells = Array.from(border).reduce((sum, point) => sum + (/\p{Script=Han}/u.test(point) ? 2 : 1), 0);
+	assert.equal(cells, stdout.columns);
 } finally {
 	key("c", undefined, true);
 	await cli;

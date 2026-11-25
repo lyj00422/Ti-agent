@@ -60,6 +60,8 @@ export interface ToolResultMessage {
 	toolCallId: string;
 	toolName: string;
 	content: Array<TextContent | ImageContent>;
+	details?: unknown;
+	structuredContent?: unknown;
 	isError: boolean;
 	timestamp: number;
 }

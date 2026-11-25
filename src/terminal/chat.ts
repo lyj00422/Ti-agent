@@ -42,6 +42,7 @@ async function startReadlineChat(options: TerminalChatOptions): Promise<void> {
 	};
 	input.on("SIGINT", close);
 	process.on("SIGINT", close);
+	process.on("SIGTERM", close);
 
 	let picker: Session[] | undefined;
 	let multiline: string[] = [];
@@ -89,6 +90,11 @@ async function startReadlineChat(options: TerminalChatOptions): Promise<void> {
 			}
 			if (event.type === "tool_execution_start") {
 				write(display(toolCallLabel(event.call)) + "\n");
+				return;
+			}
+			if (event.type === "tool_execution_update") {
+				const progress = toolProgress(event.partialResult);
+				if (progress) write(`${event.call.name} · ${progress}\n`);
 				return;
 			}
 			if (event.type !== "text_delta") {
@@ -179,6 +185,7 @@ async function startReadlineChat(options: TerminalChatOptions): Promise<void> {
 	} finally {
 		close();
 		process.off("SIGINT", close);
+		process.off("SIGTERM", close);
 	}
 }
 
@@ -194,6 +201,7 @@ async function startFullscreenChat(options: TerminalChatOptions): Promise<void> 
 		let liveUsage: Usage | undefined;
 		let compacting = false;
 		let activeTool: ToolCall | undefined;
+	let activeToolProgress = "";
 		let notice = "";
 		let noticeIsError = false;
 		let spinnerFrame = 0;
@@ -253,9 +261,10 @@ async function startFullscreenChat(options: TerminalChatOptions): Promise<void> 
 				const prefix = index === 0 ? prompt : "  ";
 				return prefix + line;
 			}).slice(hiddenInputRows);
-			const working = `${spinner[spinnerFrame]} ${compacting ? "Compacting" : activeTool ? activeTool.name : "Working"}`;
+			const activity = activeTool ? [activeTool.name, activeToolProgress].filter(Boolean).join(" · ") : "Working";
+			const working = shortenTerminalText(`${spinner[spinnerFrame]} ${compacting ? "Compacting" : activity}`, width - 5);
 			const editorBorder = busy
-				? `${styleTerminal("magenta", "── ")}${styleTerminal("dim", working)}${styleTerminal("magenta", ` ${"─".repeat(width - working.length - 4)}`)}`
+				? `${styleTerminal("magenta", "── ")}${styleTerminal("dim", working)}${styleTerminal("magenta", ` ${"─".repeat(width - terminalWidth(working) - 4)}`)}`
 				: styleTerminal("magenta", "─".repeat(width));
 
 			const footerRight = styleTerminal("magenta", options.model);
@@ -312,6 +321,7 @@ async function startFullscreenChat(options: TerminalChatOptions): Promise<void> 
 			stdin.off("keypress", onKeypress);
 			stdin.off("end", close);
 			stdout.off("resize", render);
+			process.off("SIGINT", close);
 			process.off("SIGTERM", close);
 			if (stdin.isTTY) stdin.setRawMode(false);
 			stdin.pause();
@@ -414,7 +424,10 @@ async function startFullscreenChat(options: TerminalChatOptions): Promise<void> 
 				else if (event.type === "message_end") {
 					if (event.message.role === "assistant") streamText = "";
 					if (event.message.role === "toolResult") activeTool = undefined;
-				} else if (event.type === "tool_execution_start") activeTool = event.call;
+				} else if (event.type === "tool_execution_start") {
+					activeTool = event.call;
+					activeToolProgress = "";
+				} else if (event.type === "tool_execution_update") activeToolProgress = toolProgress(event.partialResult);
 				else if (event.type === "compacting") compacting = true;
 				else if (event.type === "compacted") {
 					compacting = false;
@@ -435,6 +448,7 @@ async function startFullscreenChat(options: TerminalChatOptions): Promise<void> 
 				liveUsage = undefined;
 				compacting = false;
 				activeTool = undefined;
+				activeToolProgress = "";
 				render();
 			});
 		};
@@ -519,6 +533,7 @@ async function startFullscreenChat(options: TerminalChatOptions): Promise<void> 
 		stdin.on("keypress", onKeypress);
 		stdin.once("end", close);
 		stdout.on("resize", render);
+		process.once("SIGINT", close);
 		process.once("SIGTERM", close);
 		stdout.write("\x1b[?1049h\x1b[?25l");
 		render();
@@ -529,6 +544,11 @@ function toolCallLabel(call: ToolCall): string {
 	const target = call.arguments.path ?? call.arguments.command ?? call.arguments.pattern;
 	const preview = typeof target === "string" ? target.replace(/\\s+/g, " ").slice(0, 160) : "";
 	return preview ? call.name + " " + preview : call.name;
+}
+
+function toolProgress(result: Pick<ToolResultMessage, "content">): string {
+	const text = result.content.flatMap((block) => block.type === "text" ? [block.text] : []).join("\n").trimEnd();
+	return display(text.slice(text.lastIndexOf("\n") + 1).trim()).slice(0, 160);
 }
 
 function toolResultStatus(result: ToolResultMessage): string {
@@ -697,9 +717,19 @@ function terminalWidth(text: string): number {
 }
 
 function shortenTerminalText(text: string, width: number): string {
+	if (width <= 0) return "";
 	const safe = safeTerminalText(text);
 	if (terminalWidth(safe) <= width) return safe;
-	return `…${Array.from(safe).slice(-(width - 1)).join("")}`;
+	const points = Array.from(safe);
+	let start = points.length;
+	let cells = terminalCharacterWidth("…");
+	while (start > 0) {
+		const pointWidth = terminalCharacterWidth(points[start - 1]);
+		if (cells + pointWidth > width) break;
+		cells += pointWidth;
+		start--;
+	}
+	return `…${points.slice(start).join("")}`;
 }
 
 function previousCharacterOffset(text: string, offset: number): number {

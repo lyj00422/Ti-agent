@@ -9,7 +9,7 @@ import { createWriteToolDefinition } from "./files/write.ts";
 import { ToolRegistry } from "./registry.ts";
 
 export function createCoreTools(cwd: string): ToolRegistry {
-	const registry = new ToolRegistry();
+	const registry = new ToolRegistry(cwd);
 	registry.register(createReadToolDefinition(cwd));
 	registry.register(createBashToolDefinition(cwd));
 	if (process.platform === "win32") registry.register(createPowerShellToolDefinition(cwd));

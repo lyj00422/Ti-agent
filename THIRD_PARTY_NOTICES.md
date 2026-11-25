@@ -1,6 +1,8 @@
 # Third-party notices
 
-Portions of the built-in tools and their supporting modules are derived from [Pi](https://github.com/earendil-works/pi/tree/5a14e69c067d40dfbff4f2fff7d3b34c897e2dc9). The original copyright and license follow.
+Portions of the built-in tools, the `hello` extension example, and the MCP tool naming and schema defaults are derived from [Pi commit 5a14e69](https://github.com/earendil-works/pi/tree/5a14e69c067d40dfbff4f2fff7d3b34c897e2dc9). The example was adapted from `packages/coding-agent/examples/extensions/hello.ts`. The MCP code was adapted from `packages/mcp/src/naming.ts` and `packages/mcp/src/input-schema.ts`. The original copyright and license follow.
+
+The tool search ranker and local schema reference resolver were adapted from `packages/coding-agent/src/extensions/tool-search/tool.ts` and `packages/codemode/src/declarations.ts` at the same commit.
 
 MIT License
 

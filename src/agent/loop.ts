@@ -1,16 +1,16 @@
 import { errorMessage, toolCalls } from "./messages.ts";
 import type { AssistantMessage, ChatMessage, GenerationEvent, ToolCall, ToolResultMessage } from "./messages.ts";
-import type { ToolRegistry } from "../tools/registry.ts";
+import type { ToolResult, ToolSnapshot } from "../tools/registry.ts";
 
 export type AgentEvent = GenerationEvent
 	| { type: "message_end"; message: ChatMessage }
-	| { type: "tool_execution_start"; call: ToolCall };
+	| { type: "tool_execution_start"; call: ToolCall }
+	| { type: "tool_execution_update"; call: ToolCall; partialResult: ToolResult };
 
 const MAX_TOOL_BATCHES = 32;
 
 export async function runAgentLoop(
-	request: () => Promise<AssistantMessage>,
-	registry: ToolRegistry | undefined,
+	request: () => Promise<{ reply: AssistantMessage; tools?: ToolSnapshot }>,
 	commit: (message: ChatMessage) => void,
 	signal: AbortSignal,
 	onEvent: (event: AgentEvent) => void,
@@ -20,7 +20,7 @@ export async function runAgentLoop(
 		onEvent({ type: "message_end", message });
 	};
 	for (let batch = 0; batch < MAX_TOOL_BATCHES && !signal.aborted; batch++) {
-		const reply = await request();
+		const { reply, tools } = await request();
 		save(reply);
 		if (reply.stopReason !== "toolUse") return reply;
 
@@ -33,9 +33,12 @@ export async function runAgentLoop(
 			const skipped = signal.aborted;
 			try {
 				if (skipped) throw new Error("操作已停止，此调用未执行。");
-				if (!registry) throw new Error("此请求没有启用工具。");
-				const output = await registry.execute(call, signal);
-				result = { ...result, content: output.content, isError: output.isError === true };
+				if (!tools) throw new Error("此请求没有启用工具。");
+				const output = await tools.execute(call, signal, (partialResult) => {
+					onEvent({ type: "tool_execution_update", call, partialResult });
+				});
+				const { content, details, structuredContent, isError } = output;
+				result = { ...result, content, details, structuredContent, isError: isError === true };
 			} catch (error) {
 				const text = !skipped && signal.aborted
 					? "操作已中止，结果可能不完整。请先核查现场。 " + errorMessage(error)

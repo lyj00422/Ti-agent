@@ -1,14 +1,15 @@
 import { errorMessage, messageText, toolCalls } from "../agent/messages.ts";
-import type { AssistantMessage, ModelMessage, StreamReply, ToolDeclaration, Usage, UserMessage } from "../agent/messages.ts";
+import type { AssistantMessage, ModelMessage, StreamReply, Usage, UserMessage } from "../agent/messages.ts";
 import { runAgentLoop } from "../agent/loop.ts";
 import type { AgentEvent } from "../agent/loop.ts";
 import { buildContext, estimateContext, estimateTokens, messageForSummary, summaryMessage, unknownToolResult } from "./context.ts";
 import type { Session, SessionStore } from "./store.ts";
 import type { ToolRegistry } from "../tools/registry.ts";
+import { TOOL_SEARCH_NAME } from "../tools/tool-search.ts";
 
 export type ChatEvent = AgentEvent | { type: "compacting" } | { type: "compacted" };
 
-interface ChatSessionOptions {
+export interface ChatSessionOptions {
 	stream: StreamReply;
 	contextWindow: number;
 	reserveTokens?: number;
@@ -24,9 +25,6 @@ export class ChatSession {
 	private readonly options: ChatSessionOptions;
 	private readonly reserveTokens: number;
 	private readonly keepRecentTokens: number;
-	private readonly declarations: readonly ToolDeclaration[];
-	private readonly system: ModelMessage | undefined;
-	private readonly requestOverhead: number;
 
 	constructor(store: SessionStore, options: ChatSessionOptions) {
 		this.store = store;
@@ -34,12 +32,6 @@ export class ChatSession {
 		this.current = store.list()[0] ?? store.create();
 		this.reserveTokens = options.reserveTokens ?? 16_384;
 		this.keepRecentTokens = options.keepRecentTokens ?? 20_000;
-		this.declarations = options.tools?.declarations() ?? [];
-		this.system = options.systemPrompt
-			? { role: "system", content: [{ type: "text", text: options.systemPrompt }] }
-			: undefined;
-		this.requestOverhead = (this.system ? estimateTokens([this.system]) : 0)
-			+ (this.declarations.length ? Math.ceil(Buffer.byteLength(JSON.stringify(this.declarations)) / 3.5) : 0);
 	}
 
 	get history(): Readonly<Session["history"]> {
@@ -48,6 +40,10 @@ export class ChatSession {
 
 	get isRunning(): boolean {
 		return Boolean(this.active);
+	}
+
+	get tools(): ToolRegistry | undefined {
+		return this.options.tools;
 	}
 
 	list(): Session[] {
@@ -89,7 +85,7 @@ export class ChatSession {
 			latest: last?.usage,
 			total: input.length ? total : undefined,
 			cacheReadPartial: input.some((usage) => usage.cacheRead === undefined),
-			contextTokens: estimateContext(this.current, context, this.requestOverhead),
+			contextTokens: estimateContext(this.current, context, this.modelTools().overhead),
 			contextWindow: this.options.contextWindow,
 			inputBudget: this.options.contextWindow - this.reserveTokens,
 		};
@@ -97,7 +93,7 @@ export class ChatSession {
 
 	async send(text: string, onEvent: (event: ChatEvent) => void): Promise<AssistantMessage> {
 		const user: UserMessage = { role: "user", content: [{ type: "text", text }], timestamp: Date.now() };
-		if (estimateTokens([user]) + this.requestOverhead > this.options.contextWindow - this.reserveTokens) {
+		if (estimateTokens([user]) + this.modelTools().overhead > this.options.contextWindow - this.reserveTokens) {
 			throw new Error("当前问题单独就超过上下文预算，请缩短后再发送。");
 		}
 		return this.run(async (signal) => {
@@ -147,7 +143,6 @@ export class ChatSession {
 				forceCompact = false;
 				return this.requestReply(signal, onEvent, force);
 			},
-			this.options.tools,
 			(message) => this.store.append(this.current, message),
 			signal,
 			onEvent,
@@ -170,16 +165,34 @@ export class ChatSession {
 		}
 	}
 
-	private async requestReply(signal: AbortSignal, onEvent: (event: ChatEvent) => void, forceCompact: boolean): Promise<AssistantMessage> {
+	private modelTools() {
+		const loaded = new Set<string>();
+		for (const message of this.current.history) {
+			if (message.role !== "toolResult" || message.toolName !== TOOL_SEARCH_NAME || message.isError) continue;
+			const names = (message.details as { loaded?: unknown } | undefined)?.loaded;
+			if (Array.isArray(names)) for (const name of names) if (typeof name === "string") loaded.add(name);
+		}
+		const tools = this.options.tools?.snapshot(loaded);
+		const text = [this.options.systemPrompt, ...(tools?.prompt ?? [])].filter(Boolean).join("\n");
+		const system: ModelMessage | undefined = text
+			? { role: "system", content: [{ type: "text", text }] }
+			: undefined;
+		const overhead = (system ? estimateTokens([system]) : 0)
+			+ (tools?.declarations.length ? Math.ceil(Buffer.byteLength(JSON.stringify(tools.declarations)) / 3.5) : 0);
+		return { tools, system, overhead };
+	}
+
+	private async requestReply(signal: AbortSignal, onEvent: (event: ChatEvent) => void, forceCompact: boolean) {
+		const { tools, system, overhead } = this.modelTools();
 		let context = buildContext(this.current);
-		let contextTokens = estimateContext(this.current, context, this.requestOverhead);
+		let contextTokens = estimateContext(this.current, context, overhead);
 		const inputBudget = this.options.contextWindow - this.reserveTokens;
 		let failed: AssistantMessage | undefined;
 		if (forceCompact || contextTokens > inputBudget) {
 			try {
-				await this.compactContext(signal, onEvent);
+				await this.compactContext(signal, onEvent, overhead);
 				context = buildContext(this.current);
-				contextTokens = estimateContext(this.current, context, this.requestOverhead);
+				contextTokens = estimateContext(this.current, context, overhead);
 			} catch (error) {
 				if (error instanceof CompactionError || signal.aborted) {
 					failed = {
@@ -199,15 +212,15 @@ export class ChatSession {
 				errorMessage: "压缩后上下文仍超过预算。请缩短输入或使用 /new 开始新会话。",
 			};
 		}
-		if (failed) return failed;
-		const messages = this.system ? [this.system, ...context] : context;
+		if (failed) return { reply: failed, tools };
+		const messages = system ? [system, ...context] : context;
 		const reply = await this.options.stream(messages, {
-			signal, maxOutputTokens: this.reserveTokens, tools: this.declarations, onEvent,
+			signal, maxOutputTokens: this.reserveTokens, tools: tools?.declarations ?? [], onEvent,
 		});
-		return { ...reply, requestOverhead: this.requestOverhead || undefined };
+		return { reply: { ...reply, requestOverhead: overhead || undefined }, tools };
 	}
 
-	private async compactContext(signal: AbortSignal, onEvent: (event: ChatEvent) => void): Promise<void> {
+	private async compactContext(signal: AbortSignal, onEvent: (event: ChatEvent) => void, overhead = this.modelTools().overhead): Promise<void> {
 		signal.throwIfAborted();
 		const context = buildContext(this.current);
 		const previous = this.current.compactions.at(-1);
@@ -263,7 +276,7 @@ export class ChatSession {
 		}
 		this.store.appendCompaction(this.current, {
 			summary, firstKeptEntryId: firstKept.id,
-			tokensBefore: estimateContext(this.current, context, this.requestOverhead), usage: reply.usage,
+			tokensBefore: estimateContext(this.current, context, overhead), usage: reply.usage,
 		});
 		onEvent({ type: "compacted" });
 	}
