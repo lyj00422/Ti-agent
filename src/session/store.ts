@@ -69,7 +69,15 @@ export interface Session {
 	initialContents?: string;
 }
 
-export class SessionStore {
+export interface SessionRepository {
+	create(): Session;
+	list(): Session[];
+	append(session: Session, message: ChatMessage): void;
+	appendCompaction(session: Session, compaction: Compaction): void;
+	appendCompactionUsage(session: Session, usage: Usage): void;
+}
+
+export class SessionStore implements SessionRepository {
 	private directory: string;
 	private legacyDirectories: string[];
 	private cwd: string;
@@ -206,7 +214,8 @@ export class SessionStore {
 				history.push({ ...base, role, content: blocks.filter(isText) });
 			} else if (role === "assistant") {
 				history.push({ ...base, role, content: blocks.filter((block): block is TextContent | ToolCall => isText(block) || isCall(block)),
-					stopReason: stopReason ?? "stop", usage: readUsage(message.usage), requestOverhead: message.requestOverhead, error, errorMessage });
+					stopReason: stopReason ?? "stop", usage: readUsage(message.usage), requestOverhead: message.requestOverhead,
+					error, errorMessage });
 			} else if (typeof message.toolCallId === "string" && typeof message.toolName === "string") {
 				history.push({ ...base, role, toolCallId: message.toolCallId, toolName: message.toolName,
 					isError: message.isError === true,

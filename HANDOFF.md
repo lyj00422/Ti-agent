@@ -2,11 +2,15 @@
 
 ## 当前进度
 
+2026-11-26 模型接入统一到 Ti 自有 provider registry。内置目录、兼容 `models.json` 和扩展 `registerProvider()` 共用模型组合、`/login` 凭据存取与 `/model` 选择。扩展可注册兼容协议配置或提供自己的流式实现。USTC 通过用户的 `models.json` 注册，复用 Anthropic Messages 适配器，并沿用 `ustc` 凭据 ID。OpenAI Chat Completions、Anthropic Messages 与 Gemini 的适配器均由 Ti 源码实现。
+
+2026-11-25 将执行循环抽到 `src/agent/agent.ts`，提供 Agent/turn/message/tool 生命周期事件、异步订阅结算、steer/follow-up 队列和默认并行工具调度。工具定义可声明 sequential，结果仍按模型调用顺序提交。会话门面改为 `AgentSession`，入口改为 `prompt`/`continue`，SDK 返回 `agent` 与 `session`。DeepSeek 实现接入 `ModelProvider`/`ModelStream` 抽象并由模型描述提供 ID 和 token 上限。`AgentResourceLoader` 负责可替换的工具/扩展/MCP 组装，默认实现保留现有加载行为。旧 `src/agent/loop.ts` 和 `ChatSession` API 已删除。
+
 2026-11-24 在原有聊天基础上加入 Agent Loop、工具注册表和八个内置工具。Windows 注册 `read`、`bash`、`powershell`、`edit`、`write`、`grep`、`find` 和 `ls`。TTY 和 readline 共用会话、工具和流式事件。
 
 2026-11-25 加入与 Pi 工具层对齐的本地扩展、工具启用列表和执行钩子。扩展通过 `-e` 显式加载，SDK 通过同进程接口注入工具，MCP 通过调用方提供的客户端适配成直接声明的工具。用 `examples/extensions/hello.ts` 和 `test/extensions.test.ts` 可以逐步查看和复现。
 
-2026-11-25 接入 Pi 的独立 MCP 客户端 `@earendil-works/pi-mcp@1.5.2`。CLI 和 SDK 均可从配置连接 stdio 和 Streamable HTTP 服务，启动时注册发现的工具，退出时关闭连接。CLI 默认读取用户级 `mcp.json`，项目配置通过 `--mcp-config` 显式指定。用 `test/mcp.test.ts` 验证握手、发现、调用和关闭。
+2026-11-26 MCP 客户端迁移到 Ti 自己的 `src/tools/mcp-protocol.ts`。CLI 和 SDK 从 `mcp.json` 配置连接 stdio 和 Streamable HTTP 服务，启动时注册发现的工具，退出时关闭连接。项目配置可通过 `--mcp-config` 指定。现有 `test/mcp.test.ts` 覆盖握手、发现、调用和关闭。
 
 Ti 的配置式 MCP 服务默认按需声明。`tool_search` 使用 Pi 的 BM25 排序，搜索结果随工具结果写入会话，从下一次请求起启用。恢复会话时，仍可用的搜索结果会重新进入模型的工具列表。`ti mcp add/list/remove` 管理用户级配置，`list` 实际连接并列出发现的工具。
 
@@ -14,13 +18,15 @@ Ti 的配置式 MCP 服务默认按需声明。`tool_search` 使用 Pi 的 BM25 
 
 Ti 是独立 harness。对话轮次、DeepSeek HTTP/SSE、凭据存取、线性 JSONL 会话和 readline 交互都由 Ti 自己实现。
 
+模型实现必须保持 Ti 自有：借鉴其他项目的 provider 职责划分和 API 协议处理思路，在 Ti 的 `ModelDescriptor`、`ModelProvider`、`ModelStream` 接口内实现。禁止把 Pi AI/provider/model-catalog 包作为 npm 运行时依赖，禁止从 Pi 包导入模型实现代码，禁止直接复制 Pi 构建产物到 Ti。内置供应商在 `src/providers/catalog.ts` 维护，OpenAI-compatible、Anthropic Messages、Gemini 请求由 Ti 自有适配器处理。兼容配置格式不等于运行时依赖。
+
 工具注册入口在 `src/tools/index.ts`。实现按文件、搜索、Shell、图像与输出分目录。文件命令与工具注册表通过工具定义相接，Bash 和 PowerShell 共享执行结果、超时和输出截断逻辑。许可信息见 `THIRD_PARTY_NOTICES.md`。
 
 ## 调用路径
 
-`main.ts` 调用 `src/sdk.ts` 组装内置工具、外部扩展和 `ChatSession`。每次模型请求捕获当前工具列表，用同一份快照生成声明、提示和执行函数。`src/agent/loop.ts` 调用模型，提交完整助手消息，按顺序执行调用，并在继续请求模型前提交每个结果。单轮上限是 32 批调用。会话层持有整轮中止信号，并根据当前工具列表计算上下文预算和提示。
+`main.ts` 调用 `src/sdk.ts` 组装内置工具、外部扩展、MCP、模型 Provider 与 `AgentSession`。`Agent` 管理运行和调度，`AgentSession` 提供持久化 transcript、上下文预算和压缩请求。工具快照在每次模型请求时捕获，默认并行执行，声明 sequential 的工具会令整批顺序执行。模型事件由 Agent runtime 统一发布。
 
-`src/agent/messages.ts` 定义文本、图片、工具调用和工具结果。`src/providers/deepseek.ts` 按 SSE 索引组装工具参数，并在请求中用 `tool_call_id` 关联结果。图片经过格式转换或缩放后，由适配器随工具结果附上。
+`src/agent/messages.ts` 定义文本、图片、工具调用和工具结果。`src/providers/model-registry.ts` 组合三种模型来源，按协议选择内置或扩展流式实现。`src/providers/openai-completions.ts` 按 SSE 索引组装工具参数，并在请求中用 `tool_call_id` 关联结果。图片经过格式转换或缩放后，由适配器随工具结果附上。
 
 `SessionStore` 读写 Ti v3 线性 JSONL，也能读取旧版 v3 文本聊天记录。旧目录会话在首次写入时复制到主目录。`/retry` 从已保存的用户消息或工具结果继续。进程重启后，若末尾有调用缺少结果，会追加同 ID 的「结果未知」记录，供模型先检查现场。压缩保留完整的近期用户轮次，早期工具调用和结果纳入摘要。
 
@@ -30,7 +36,7 @@ Ti 是独立 harness。对话轮次、DeepSeek HTTP/SSE、凭据存取、线性 
 
 会话通常默认放在用户级数据目录，方便跨项目管理。本项目为了学习和检查持久化格式，特意将 JSONL 放在项目 `.ti/sessions/`，可用 `TI_SESSION_HOME` 覆盖。`.ti/` 已加入 Git 忽略规则，不进入提交。API Key 放在用户目录 `~/.ti/auth.json`，可用 `TI_HOME` 覆盖凭据目录。需要读取旧目录时，通过 `TI_LEGACY_HOME` 指定。
 
-环境变量 `DEEPSEEK_API_KEY` 优先。新 Key 写到 `~/.ti/auth.json`。旧 auth.json 只兼容普通字面量 key，不解析命令或环境变量模板。
+凭据保存到 `~/.ti/auth.json`，按 provider ID 隔离。各 provider 也可通过自身 API Key 环境变量认证。旧 auth.json 只兼容普通字面量 key，不解析命令或环境变量模板。
 
 ## 能力边界
 
@@ -41,7 +47,7 @@ Ti 是独立 harness。对话轮次、DeepSeek HTTP/SSE、凭据存取、线性 
 
 ## 验证
 
-`node --test test/chat.test.ts test/tools.test.ts test/extensions.test.ts test/mcp.test.ts` 覆盖聊天、内置工具、本地扩展、SDK 注入、MCP 注册和传输、图片回传、工具分片、重启重试、工具轮次压缩和终端入口。真实模型体验示例见 README。
+`node --test test/agent.test.ts test/chat.test.ts test/models.test.ts test/tools.test.ts test/extensions.test.ts test/mcp.test.ts` 覆盖 Agent 调度、会话、Ti 自有模型适配器与模型选择、本地扩展、SDK 注入、MCP 注册和传输、图片回传、工具分片、恢复、压缩和终端入口。模型端点使用模拟响应验证。
 
 手动体验时，用 `npm start` 启动 Ti，聊几轮后执行 `/usage` 查看实报用量和上下文估算，再用 `/compact` 压缩早期对话。重启后继续当前会话，可以在 JSONL 中查看完整消息和追加的压缩记录。
 \n

@@ -2,8 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, open, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { parseArgs } from "node:util";
-import { validateMcpServerConfig } from "@earendil-works/pi-mcp";
-import { connectMcpServers, mcpExposure, readMcpConfig, readMcpServers } from "./mcp-client.ts";
+import { connectMcpServers, mcpExposure, readMcpConfig, readMcpServers, validateMcpServerConfig } from "./mcp-client.ts";
 import { ToolRegistry } from "./registry.ts";
 
 const usage = [
@@ -108,8 +107,7 @@ export async function runMcpCommand(args: string[], path: string, cwd: string, s
 		config = { command, args: commandArgs, cwd: values.cwd, ...(values.env ? { env: parsePairs(values.env, "--env") } : {}) };
 	}
 	if (values.exposure !== undefined) config.exposure = exposure;
-	const checked = validateMcpServerConfig(name, config);
-	if (checked.kind === "invalid") throw new Error(checked.error);
+	validateMcpServerConfig(name, config);
 	signal.throwIfAborted();
 	await updateConfig(path, (servers) => {
 		const namespace = name.replaceAll("-", "_");

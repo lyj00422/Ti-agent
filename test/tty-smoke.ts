@@ -4,8 +4,9 @@ import { stdin, stdout } from "node:process";
 import { stripVTControlCharacters } from "node:util";
 import { Type } from "typebox";
 import { messageText } from "../src/agent/messages.ts";
-import type { AssistantMessage, StreamReply } from "../src/agent/messages.ts";
-import { ChatSession } from "../src/session/chat-session.ts";
+import type { AssistantMessage } from "../src/agent/messages.ts";
+import type { ModelStream } from "../src/providers/types.ts";
+import { AgentSession } from "../src/session/agent-session.ts";
 import { SessionStore } from "../src/session/store.ts";
 import { startTerminalChat } from "../src/terminal/chat.ts";
 import { createCoreTools } from "../src/tools/index.ts";
@@ -22,7 +23,7 @@ for (let index = 0; index < 12; index++) {
 	store.append(previous, assistant("answer " + index));
 }
 
-const stream: StreamReply = async (context, { signal, onEvent }) => {
+const stream: ModelStream = async (context, { signal, onEvent }) => {
 	assert.equal(signal.aborted, false);
 	if (messageText(context.at(-1)!) === "list") {
 		onEvent({ type: "text_delta", text: "Inspecting" });
@@ -55,7 +56,7 @@ tools.register({
 		return { content: [{ type: "text", text: "Finished" }] };
 	},
 });
-const session = new ChatSession(store, { stream, contextWindow: 1_000_000, tools });
+const session = new AgentSession(store, { stream, contextWindow: 1_000_000, tools });
 let screen = "";
 Object.defineProperties(stdin, { isTTY: { value: true }, setRawMode: { value: () => stdin } });
 Object.defineProperties(stdout, { isTTY: { value: true }, rows: { value: 12 }, columns: { value: 90 } });
@@ -67,7 +68,26 @@ const send = (text: string) => {
 	key("return");
 };
 let savedKey = "";
-const cli = startTerminalChat({ model: "mock", session, login: (value) => { savedKey = value; } });
+let selectedModel = "mock/mock";
+let thinkingLevel = "medium";
+let savedThinking = "";
+const cli = startTerminalChat({
+	session,
+	getModel: () => selectedModel,
+	models: () => [
+		{ provider: "mock", id: "mock", name: "mock", label: "mock/mock" },
+		{ provider: "proxy", id: "other", name: "other", label: "proxy/other" },
+	],
+	selectModel: (reference) => { selectedModel = reference; return selectedModel; },
+	providers: () => ["mock", "proxy"],
+	login: (provider, value) => { assert.equal(provider, "proxy"); savedKey = value; },
+	getThinking: () => thinkingLevel,
+	thinkingLevels: () => ["off", "minimal", "low", "medium", "high", "xhigh"],
+	setThinking: (level, persist) => {
+		if (persist) savedThinking = level;
+		return thinkingLevel = level;
+	},
+});
 try {
 	for (let step = 0; step < 30; step++) key("up");
 	assert.match(screen, /message 0/);
@@ -85,9 +105,23 @@ try {
 	assert.equal(messageText(session.history.at(-1)!), "next answer");
 	assert.equal(messageText(store.list()[0].history.at(-3)!), "visible partial");
 	send("/login");
+	key("down");
+	key("return");
 	send("hidden-test-key");
 	assert.equal(savedKey, "hidden-test-key");
 	assert.doesNotMatch(screen, /hidden-test-key/);
+	send("/model");
+	key("down");
+	key("return");
+	assert.equal(selectedModel, "proxy/other");
+	stdin.emit("keypress", undefined, { name: "tab", shift: true, sequence: "\x1b[Z" });
+	assert.equal(thinkingLevel, "high");
+	assert.match(screen, /Thinking level: high/);
+	send("/thinking");
+	key("down");
+	key("s", undefined, true);
+	assert.equal(thinkingLevel, "xhigh");
+	assert.equal(savedThinking, "xhigh");
 	send("/new");
 	assert.equal(session.history.length, 0);
 	send("/resume");

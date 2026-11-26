@@ -1,46 +1,6 @@
-import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 import { errorMessage, messageText, toolCalls } from "../agent/messages.ts";
-import type { AssistantMessage, ChatError, ModelMessage, StreamReply, ToolCall, Usage } from "../agent/messages.ts";
-
-export const MODEL_ID = "deepseek-flash";
-export const CONTEXT_WINDOW = 1_000_000;
-
-function readKey(directory: string): string | undefined {
-	const path = join(directory, "auth.json");
-	let file: string;
-	try {
-		file = readFileSync(path, "utf8");
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-		throw error;
-	}
-	const credential = JSON.parse(file.replace(/^\uFEFF/, ""))?.deepseek;
-	return credential?.type === "api_key" && typeof credential.key === "string" ? credential.key.trim() : undefined;
-}
-
-export function getKey(home: string, legacyHome?: string): string {
-	const key = process.env.DEEPSEEK_API_KEY?.trim() || readKey(home);
-	if (key) return key;
-
-	const legacyKey = legacyHome ? readKey(legacyHome) : undefined;
-	if (legacyKey && !legacyKey.startsWith("!") && !legacyKey.includes("$")) return legacyKey;
-	throw new Error("请用 /login 保存 DeepSeek API Key，或设置 DEEPSEEK_API_KEY。");
-}
-
-export function saveKey(home: string, value: string): void {
-	const key = value.trim();
-	if (!key || /\s/.test(key)) throw new Error("请输入有效的 DeepSeek API Key。");
-	mkdirSync(home, { recursive: true, mode: 0o700 });
-	const temporary = join(home, `auth-${randomUUID()}.tmp`);
-	writeFileSync(temporary, JSON.stringify({ deepseek: { type: "api_key", key } }) + "\n", { mode: 0o600, flag: "wx" });
-	try {
-		renameSync(temporary, join(home, "auth.json"));
-	} finally {
-		rmSync(temporary, { force: true });
-	}
-}
+import type { AssistantMessage, ChatError, ModelMessage, ToolCall, Usage } from "../agent/messages.ts";
+import type { ProviderStream } from "./types.ts";
 
 interface ToolCallDelta {
 	index: number;
@@ -54,11 +14,9 @@ interface CompletionChunk {
 	error?: { message?: string; code?: string; type?: string };
 }
 
-export async function streamReply(
-	context: readonly ModelMessage[],
-	getKey: () => string,
-	{ signal, maxOutputTokens, tools, onEvent }: Parameters<StreamReply>[1],
-): Promise<AssistantMessage> {
+export const streamOpenAiCompletions: ProviderStream = async (model, context, options) => {
+	const { signal, maxOutputTokens, tools, onEvent } = options;
+	const provider = model.provider === "deepseek" ? "DeepSeek" : model.provider;
 	const timestamp = Date.now();
 	let reply = "";
 	let stopReason: "stop" | "length" | "toolUse" = "stop";
@@ -75,19 +33,32 @@ export async function streamReply(
 	});
 	let key: string;
 	try {
-		key = getKey();
+		key = options.resolveApiKey();
 	} catch (error) {
 		return finish("error", { kind: "auth", message: errorMessage(error) });
 	}
-	const messages = encodeMessages(context);
+	const messages = encodeMessages(context, model.provider === "deepseek");
 
 	try {
-		const response = await fetch("https://api.deepseek.com/chat/completions", {
+		const baseUrl = model.baseUrl!;
+		const maxTokensField = model.compat?.maxTokensField
+			?? (new URL(baseUrl).hostname === "api.openai.com" ? "max_completion_tokens" : "max_tokens");
+		const endpoint = /\/chat\/completions\/?$/i.test(baseUrl)
+			? baseUrl
+			: baseUrl.replace(/\/+$/, "") + "/chat/completions";
+		const response = await fetch(endpoint, {
 			method: "POST",
-			headers: { authorization: `Bearer ${key}`, "content-type": "application/json", accept: "text/event-stream" },
+			headers: { ...model.headers, authorization: `Bearer ${key}`, "content-type": "application/json", accept: "text/event-stream" },
 			body: JSON.stringify({
-				model: MODEL_ID, messages, stream: true, stream_options: { include_usage: true },
-				thinking: { type: "disabled" }, max_tokens: maxOutputTokens,
+				model: model.id, messages, stream: true,
+				...(model.compat?.supportsUsageInStreaming === false ? {} : { stream_options: { include_usage: true } }),
+				...(model.provider === "deepseek" ? {
+					thinking: options.thinkingLevel && options.thinkingLevel !== "off" ? { type: "enabled" } : { type: "disabled" },
+					...(options.thinkingLevel && options.thinkingLevel !== "off"
+						? { reasoning_effort: model.thinkingLevelMap?.[options.thinkingLevel] ?? options.thinkingLevel } : {}),
+				} : options.thinkingLevel && options.thinkingLevel !== "off" && model.reasoning
+					? { reasoning_effort: model.thinkingLevelMap?.[options.thinkingLevel] ?? options.thinkingLevel } : {}),
+				[maxTokensField]: Math.min(maxOutputTokens ?? model.maxOutputTokens, model.maxOutputTokens),
 				tools: tools?.length ? tools.map((tool) => ({ type: "function", function: tool })) : undefined,
 			}),
 			signal,
@@ -95,9 +66,9 @@ export async function streamReply(
 		if (!response.ok) {
 			const body = (await response.text()).trim();
 			const error = body.startsWith("{") ? parseErrorBody(body) : undefined;
-			return finish("error", classifyError(error, `DeepSeek HTTP ${response.status}`, response.status));
+			return finish("error", classifyError(error, `${provider} HTTP ${response.status}`, response.status));
 		}
-		if (!response.body) return finish("error", { kind: "protocol", message: "DeepSeek 返回了空响应。" });
+		if (!response.body) return finish("error", { kind: "protocol", message: `${provider} 返回了空响应。` });
 
 		let pending = "";
 		let data: string[] = [];
@@ -116,19 +87,19 @@ export async function streamReply(
 					if (stopReason === "toolUse") {
 						const calls = [...pendingCalls].sort(([a], [b]) => a - b).map(([, call]) => parseToolCall(call));
 						if (!calls.length || calls.some((call) => !call.id || !call.name) || new Set(calls.map((call) => call.id)).size !== calls.length) {
-							return finish("error", { kind: "protocol", message: "DeepSeek 返回了不完整或重复的工具调用标识。" });
+							return finish("error", { kind: "protocol", message: `${provider} 返回了不完整或重复的工具调用标识。` });
 						}
 						return finish("toolUse", undefined, calls);
 					}
 					if (pendingCalls.size && stopReason !== "length") {
-						return finish("error", { kind: "protocol", message: "DeepSeek 未完整结束工具调用。" });
+						return finish("error", { kind: "protocol", message: `${provider} 未完整结束工具调用。` });
 					}
-					if (!reply && stopReason === "stop") return finish("error", { kind: "protocol", message: "DeepSeek 未返回文本。" });
+					if (!reply && stopReason === "stop") return finish("error", { kind: "protocol", message: `${provider} 未返回文本。` });
 					return finish(stopReason);
 				}
 
 				const chunk: CompletionChunk = JSON.parse(payload);
-				if (chunk.error) return finish("error", classifyError(chunk.error, "DeepSeek 返回了流式错误。"));
+				if (chunk.error) return finish("error", classifyError(chunk.error, `${provider} 返回了流式错误。`));
 				const raw = chunk.usage;
 				if (typeof raw?.prompt_tokens === "number" && typeof raw.completion_tokens === "number") {
 					usage = {
@@ -141,7 +112,7 @@ export async function streamReply(
 				const choice = chunk.choices?.[0];
 				for (const update of choice?.delta?.tool_calls ?? []) {
 					if (!Number.isSafeInteger(update.index) || update.index < 0) {
-						return finish("error", { kind: "protocol", message: "DeepSeek 返回了无效的工具调用索引。" });
+						return finish("error", { kind: "protocol", message: `${provider} 返回了无效的工具调用索引。` });
 					}
 					const call = pendingCalls.get(update.index) ?? { id: "", name: "", arguments: "" };
 					if (!call.id && typeof update.id === "string") call.id = update.id;
@@ -157,16 +128,16 @@ export async function streamReply(
 				switch (choice?.finish_reason) {
 					case "tool_calls": stopReason = "toolUse"; break;
 					case "length": stopReason = "length"; break;
-					case "content_filter": return finish("error", { kind: "provider", message: "DeepSeek 已过滤此回复。" });
+					case "content_filter": return finish("error", { kind: "provider", message: `${provider} 已过滤此回复。` });
 				}
 			}
 		}
-		return signal.aborted ? finish("aborted") : finish("error", { kind: "network", message: "DeepSeek 响应提前结束。" });
+		return signal.aborted ? finish("aborted") : finish("error", { kind: "network", message: `${provider} 响应提前结束。` });
 	} catch (error) {
 		if (signal.aborted) return finish("aborted");
 		return finish("error", { kind: error instanceof SyntaxError ? "protocol" : "network", message: errorMessage(error) });
 	}
-}
+};
 
 function parseToolCall(call: { id: string; name: string; arguments: string }): ToolCall {
 	const base = { type: "toolCall" as const, id: call.id, name: call.name };
@@ -181,7 +152,7 @@ function parseToolCall(call: { id: string; name: string; arguments: string }): T
 	return { ...base, arguments: {}, argumentError: "工具参数必须是完整的 JSON 对象。" };
 }
 
-function encodeMessages(context: readonly ModelMessage[]): object[] {
+function encodeMessages(context: readonly ModelMessage[], deepseek: boolean): object[] {
 	const messages: object[] = [];
 	for (let index = 0; index < context.length; index++) {
 		const message = context[index];
@@ -189,7 +160,8 @@ function encodeMessages(context: readonly ModelMessage[]): object[] {
 		if (message.role === "assistant") {
 			const calls = toolCalls(message);
 			messages.push({
-				role: "assistant", content: content || (calls.length ? null : ""), reasoning_content: "",
+				role: "assistant", content: content || (calls.length ? null : ""),
+				...(deepseek ? { reasoning_content: "" } : {}),
 				tool_calls: calls.length ? calls.map((call) => ({
 					id: call.id, type: "function",
 					function: { name: call.name, arguments: JSON.stringify(call.arguments) },

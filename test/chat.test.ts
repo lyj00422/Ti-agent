@@ -7,9 +7,11 @@ import { test } from "node:test";
 import type { TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 import { messageText } from "../src/agent/messages.ts";
-import type { AssistantMessage, ModelMessage, StreamReply } from "../src/agent/messages.ts";
-import { ChatSession } from "../src/session/chat-session.ts";
-import { streamReply } from "../src/providers/deepseek.ts";
+import type { AssistantMessage, ModelMessage } from "../src/agent/messages.ts";
+import type { ModelStream } from "../src/providers/types.ts";
+import { AgentSession } from "../src/session/agent-session.ts";
+import { BUILTIN_MODELS } from "../src/providers/catalog.ts";
+import { streamOpenAiCompletions } from "../src/providers/openai-completions.ts";
 import { SessionStore } from "../src/session/store.ts";
 
 function homes(t: TestContext) {
@@ -24,6 +26,7 @@ function assistant(text: string, options: Partial<AssistantMessage> = {}): Assis
 
 const ignore = () => {};
 const messages: ModelMessage[] = [{ role: "user", content: [{ type: "text", text: "hello" }] }];
+const deepseek = BUILTIN_MODELS.find((model) => model.provider === "deepseek")!;
 
 test("DeepSeek handles split text and a usage-only event before DONE", async (t) => {
 	const response = [
@@ -44,7 +47,8 @@ test("DeepSeek handles split text and a usage-only event before DONE", async (t)
 		}));
 	});
 	const events: unknown[] = [];
-	const reply = await streamReply(messages, () => "test", {
+	const reply = await streamOpenAiCompletions(deepseek, messages, {
+		resolveApiKey: () => "test",
 		signal: new AbortController().signal, maxOutputTokens: 50, onEvent: (event) => events.push(event),
 	});
 	assert.equal(messageText(reply), "你好");
@@ -55,7 +59,7 @@ test("DeepSeek handles split text and a usage-only event before DONE", async (t)
 test("DeepSeek distinguishes auth, rate limits, context overflow, truncation, and a broken stream", async (t) => {
 	let response = new Response();
 	t.mock.method(globalThis, "fetch", async () => response);
-	const request = () => streamReply(messages, () => "test", { signal: new AbortController().signal, onEvent: ignore });
+	const request = () => streamOpenAiCompletions(deepseek, messages, { resolveApiKey: () => "test", signal: new AbortController().signal, onEvent: ignore });
 	response = new Response('{"error":{"message":"invalid key"}}', { status: 401 });
 	assert.equal((await request()).error?.kind, "auth");
 	response = new Response(null, { status: 429 });
@@ -86,7 +90,8 @@ test("aborting DeepSeek cancels the active stream and retains its partial text",
 			},
 		}));
 	});
-	const reply = await streamReply(messages, () => "test", {
+	const reply = await streamOpenAiCompletions(deepseek, messages, {
+		resolveApiKey: () => "test",
 		signal: abort.signal, onEvent: (event) => {
 			if (event.type === "text_delta") abort.abort();
 		},
@@ -99,17 +104,17 @@ test("retry after restart reuses the original persisted user message", async (t)
 	const { current, old, cwd } = homes(t);
 	const store = new SessionStore(current, [old], cwd);
 	let attempt = 0;
-	const stream: StreamReply = async (context) => {
+	const stream: ModelStream = async (context) => {
 		assert.deepEqual(context.map(messageText), ["one question"]);
 		assert.equal(store.list()[0].history.filter((message) => message.role === "user").length, 1);
 		return ++attempt === 1 ? assistant("unfinished", { stopReason: "error", errorMessage: "disconnected" }) : assistant("answer");
 	};
-	const first = new ChatSession(store, { stream, contextWindow: 1_000_000 });
-	assert.equal((await first.send("one question", ignore)).stopReason, "error");
-	const restored = new ChatSession(store, { stream, contextWindow: 1_000_000 });
-	assert.equal(messageText(await restored.retry(ignore)), "answer");
+	const first = new AgentSession(store, { stream, contextWindow: 1_000_000 });
+	assert.equal((await first.prompt("one question", ignore)).stopReason, "error");
+	const restored = new AgentSession(store, { stream, contextWindow: 1_000_000 });
+	assert.equal(messageText(await restored.continue(ignore)), "answer");
 	assert.deepEqual(restored.history.map((message) => message.role), ["user", "assistant", "assistant"]);
-	await assert.rejects(restored.retry(ignore), /没有可重试/);
+	await assert.rejects(restored.continue(ignore), /没有可重试/);
 	assert.equal(attempt, 2);
 });
 
@@ -120,7 +125,7 @@ test("automatic compaction uses actual usage, persists its boundary, and can be 
 	const earlier = "Old details. ".repeat(38);
 	const recent = "Current question. ".repeat(5);
 	let summaries = 0;
-	const stream: StreamReply = async (context) => {
+	const stream: ModelStream = async (context) => {
 		const text = context.map(messageText);
 		requests.push(text);
 		if (text[0].startsWith("Summarize this")) {
@@ -139,25 +144,25 @@ test("automatic compaction uses actual usage, persists its boundary, and can be 
 			: assistant("Answer.", { usage: { input: 70, output: 5, cacheRead: 0 } });
 	};
 	const options = { stream, contextWindow: 460, reserveTokens: 90, keepRecentTokens: 35 };
-	const first = new ChatSession(store, options);
-	await first.send(earlier, ignore);
+	const first = new AgentSession(store, options);
+	await first.prompt(earlier, ignore);
 	assert.equal(first.usage().contextTokens, 375);
 	const events: string[] = [];
-	await first.send(recent, (event) => events.push(event.type));
-	assert.deepEqual(events, ["compacting", "compacted", "message_end"]);
+	await first.prompt(recent, (event) => events.push(event.type));
+	assert.deepEqual(events, ["agent_start", "message_start", "message_end", "turn_start", "compacting", "compacted", "message_start", "message_end", "turn_end", "agent_end"]);
 	assert.deepEqual(requests[2], ["Earlier conversation summary (context only):\nA summary.", recent]);
 	assert.equal(first.usage().total?.input, 560);
 	assert.equal(first.usage().total?.cacheRead, 100);
-	const restored = new ChatSession(store, options);
+	const restored = new AgentSession(store, options);
 	assert.equal(restored.usage().contextTokens, 75);
 	assert.equal(restored.history.length, 4);
-	await restored.send("Follow-up", ignore);
+	await restored.prompt("Follow-up", ignore);
 	assert.deepEqual(requests[3], [...requests[2], "Answer.", "Follow-up"]);
 
 	const prior = store.list()[0].compactions[0];
 	await assert.rejects(restored.compact(ignore), /未收到完整/);
 	assert.deepEqual(store.list()[0].compactions, [prior]);
-	assert.equal(new ChatSession(store, options).usage().total?.input, 655);
+	assert.equal(new AgentSession(store, options).usage().total?.input, 655);
 	await restored.compact(ignore);
 	const saved = store.list()[0];
 	assert.equal(saved.compactions.length, 2);
@@ -169,7 +174,7 @@ test("retry can compact on provider-confirmed overflow under the local estimate"
 	const { current, cwd } = homes(t);
 	const store = new SessionStore(current, [], cwd);
 	let attempts = 0;
-	const stream: StreamReply = async (context) => {
+	const stream: ModelStream = async (context) => {
 		switch (++attempts) {
 			case 1: return assistant("old answer");
 			case 2: return assistant("", { stopReason: "error", error: { kind: "contextOverflow", message: "maximum context length" } });
@@ -181,10 +186,10 @@ test("retry can compact on provider-confirmed overflow under the local estimate"
 				return assistant("new answer");
 		}
 	};
-	const session = new ChatSession(store, { stream, contextWindow: 1_000_000 });
-	await session.send("Old material. ".repeat(40), ignore);
-	await session.send("new question", ignore);
-	assert.equal(messageText(await session.retry(ignore)), "new answer");
+	const session = new AgentSession(store, { stream, contextWindow: 1_000_000 });
+	await session.prompt("Old material. ".repeat(40), ignore);
+	await session.prompt("new question", ignore);
+	assert.equal(messageText(await session.continue(ignore)), "new answer");
 	assert.equal(session.history.filter((message) => message.role === "user").length, 2);
 });
 
@@ -197,12 +202,12 @@ test("legacy text content is restored and append migrates to the current directo
 	}) + "\n";
 	writeFileSync(legacy.path, legacyContents);
 	const store = new SessionStore(current, [old], cwd);
-	const stream: StreamReply = async (context) => {
+	const stream: ModelStream = async (context) => {
 		assert.deepEqual(context.map(messageText), ["saved prompt"]);
 		return assistant("continued");
 	};
-	const session = new ChatSession(store, { stream, contextWindow: 1_000_000 });
-	await session.retry(ignore);
+	const session = new AgentSession(store, { stream, contextWindow: 1_000_000 });
+	await session.continue(ignore);
 	assert.equal(readFileSync(legacy.path, "utf8"), legacyContents);
 	assert.deepEqual(store.list()[0].history.map(messageText), ["saved prompt", "continued"]);
 });
@@ -226,17 +231,19 @@ test("the CLI uses the saved key and resumes the session on restart", (t) => {
 	const run = (input: string, home = current, legacyHome = "") => {
 		const result = spawnSync(process.execPath, ["--import", preload, main], {
 			cwd, input, encoding: "utf8", timeout: 10_000,
-			env: { ...process.env, DEEPSEEK_API_KEY: "", TI_HOME: home, TI_SESSION_HOME: home, TI_LEGACY_HOME: legacyHome },
+			env: { ...process.env, DEEPSEEK_API_KEY: "", TI_PROVIDER: "deepseek", TI_HOME: home, TI_SESSION_HOME: home, TI_LEGACY_HOME: legacyHome },
 		});
 		assert.ifError(result.error);
 		assert.equal(result.status, 0, result.stderr);
 		assert.doesNotMatch(result.stdout, /请求失败|fake-cli-key/);
 		return result.stdout;
 	};
-	const first = run("/login\nfake-cli-key\nfirst\n/usage\n/exit\n");
+	const first = run("/login deepseek\nfake-cli-key\n/model deepseek/deepseek-flash\nfirst\n/usage\n/exit\n");
+	assert.match(first, /当前模型：deepseek\/deepseek-flash/);
 	assert.match(first, /Ti> first/);
 	assert.match(first, /输入 9 · 输出 4 · 缓存命中 2/);
 	const second = run("second\n/new\nthird\n/exit\n");
+	assert.match(second, /^Ti · deepseek\/deepseek-flash/);
 	assert.match(second, /Ti> first \/ first \/ second/);
 	assert.match(second, /Ti> third/);
 	const store = new SessionStore(current, [], cwd);

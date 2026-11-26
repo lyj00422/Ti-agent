@@ -73,11 +73,6 @@ export type ModelMessage = Pick<UserMessage, "role" | "content">
 	| { role: "system"; content: TextContent[] };
 export type GenerationEvent = { type: "text_delta"; text: string } | { type: "usage"; usage: Usage };
 
-export type StreamReply = (
-	messages: readonly ModelMessage[],
-	options: { signal: AbortSignal; maxOutputTokens?: number; tools?: readonly ToolDeclaration[]; onEvent: (event: GenerationEvent) => void },
-) => Promise<AssistantMessage>;
-
 export function messageText(message: ModelMessage): string {
 	return message.content.flatMap((block) => block.type === "text" ? [block.text] : []).join("");
 }

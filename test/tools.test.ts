@@ -10,11 +10,14 @@ import { test } from "node:test";
 import type { TestContext } from "node:test";
 import { messageText } from "../src/agent/messages.ts";
 import type { AssistantMessage, ToolCall } from "../src/agent/messages.ts";
-import { ChatSession } from "../src/session/chat-session.ts";
-import { streamReply } from "../src/providers/deepseek.ts";
+import { AgentSession } from "../src/session/agent-session.ts";
+import { BUILTIN_MODELS } from "../src/providers/catalog.ts";
+import { streamOpenAiCompletions } from "../src/providers/openai-completions.ts";
 import { SessionStore } from "../src/session/store.ts";
 import { createCoreTools } from "../src/tools/index.ts";
 import { findSearchBinary } from "../src/tools/search/binaries.ts";
+
+const deepseek = BUILTIN_MODELS.find((model) => model.provider === "deepseek")!;
 
 function fixture(t: TestContext) {
 	const root = mkdtempSync(join(tmpdir(), "ti tools "));
@@ -133,11 +136,11 @@ test("read image results survive a restart and reach DeepSeek after the matching
 		assert.match(body.messages.at(-1).content[1].image_url.url, /^data:image\/png;base64,/);
 		return sse({ delta: { content: "Read the image" }, finish_reason: "stop" });
 	});
-	const session = new ChatSession(store, {
+	const session = new AgentSession(store, {
 		tools, contextWindow: 100_000,
-		stream: (context, options) => streamReply(context, () => "test", options),
+		stream: (context, options) => streamOpenAiCompletions(deepseek, context, { ...options, resolveApiKey: () => "test" }),
 	});
-	const reply = await session.send("read it", () => {});
+	const reply = await session.prompt("read it", () => {});
 	assert.equal(messageText(reply), "Read the image", reply.errorMessage);
 	const result = store.list()[0].history.find((entry) => entry.role === "toolResult");
 	assert.equal(result?.toolCallId, "pic");
@@ -179,12 +182,12 @@ test("the agent completes fragmented batches, survives tool failures and checks 
 				return sse({ delta: { content: "Verified the change" }, finish_reason: "stop" });
 		}
 	});
-	const session = new ChatSession(store, {
+	const session = new AgentSession(store, {
 		tools, systemPrompt: "Use the active project tools.", contextWindow: 100_000,
-		stream: (context, options) => streamReply(context, () => "test", options),
+		stream: (context, options) => streamOpenAiCompletions(deepseek, context, { ...options, resolveApiKey: () => "test" }),
 	});
 	const started: string[] = [];
-	assert.equal(messageText(await session.send("Replace before with after", (event) => {
+	assert.equal(messageText(await session.prompt("Replace before with after", (event) => {
 		if (event.type === "tool_execution_start") {
 			assert.ok(store.list()[0].history.some((entry) => entry.role === "assistant"
 				&& entry.content.some((block) => block.type === "toolCall" && block.id === event.call.id)));
@@ -201,11 +204,11 @@ test("truncated tool arguments do not execute", async (t) => {
 		{ delta: { tool_calls: [{ index: 0, id: "cut", function: { name: "write", arguments: '{"path":"bad.txt","content":"bad"}' } }] } },
 		{ finish_reason: "length" },
 	));
-	const session = new ChatSession(store, {
+	const session = new AgentSession(store, {
 		tools, contextWindow: 100_000,
-		stream: (context, options) => streamReply(context, () => "test", options),
+		stream: (context, options) => streamOpenAiCompletions(deepseek, context, { ...options, resolveApiKey: () => "test" }),
 	});
-	assert.equal((await session.send("write", () => {})).stopReason, "length");
+	assert.equal((await session.prompt("write", () => {})).stopReason, "length");
 	assert.equal(existsSync(join(cwd, "bad.txt")), false);
 	assert.equal(store.list()[0].history.length, 2);
 });
@@ -215,14 +218,14 @@ test("retry resumes a completed or interrupted action without replaying it", asy
 	const filename = join(cwd, "state.txt");
 	const action = assistant("", { stopReason: "toolUse", content: [call("write", { path: "state.txt", content: "original" })] });
 	let requested = 0;
-	const first = new ChatSession(store, {
+	const first = new AgentSession(store, {
 		tools, contextWindow: 100_000,
 		stream: async () => ++requested === 1 ? action : assistant("", { stopReason: "error" }),
 	});
-	await first.send("write a file", () => {});
+	await first.prompt("write a file", () => {});
 	assert.equal(readFileSync(filename, "utf8"), "original");
 	writeFileSync(filename, "a later change");
-	const options: ConstructorParameters<typeof ChatSession>[1] = {
+	const options: ConstructorParameters<typeof AgentSession>[1] = {
 		tools, contextWindow: 100_000,
 		stream: async (context) => {
 			const result = context.at(-1);
@@ -232,16 +235,16 @@ test("retry resumes a completed or interrupted action without replaying it", asy
 			return assistant("continued");
 		},
 	};
-	await new ChatSession(store, options).retry(() => {});
+	await new AgentSession(store, options).continue(() => {});
 	assert.equal(readFileSync(filename, "utf8"), "a later change");
 
 	const interrupted = store.create();
 	store.append(interrupted, { role: "user", timestamp: Date.now(), content: [{ type: "text", text: "write again" }] });
 	store.append(interrupted, action);
 	requested++;
-	const restarted = new ChatSession(store, options);
+	const restarted = new AgentSession(store, options);
 	restarted.resume(store.list().find((entry) => entry.path === interrupted.path)!);
-	await restarted.retry(() => {});
+	await restarted.continue(() => {});
 	assert.equal(readFileSync(filename, "utf8"), "a later change");
 	assert.deepEqual(store.list().find((entry) => entry.path === interrupted.path)!.history.map((entry) => entry.role),
 		["user", "assistant", "toolResult", "assistant"]);
@@ -260,7 +263,7 @@ test("compaction summarizes tool activity and retains the recent call and result
 		store.append(seeded, assistant(id + " answer"));
 	}
 	let summaryCalled = false;
-	const options: ConstructorParameters<typeof ChatSession>[1] = {
+	const options: ConstructorParameters<typeof AgentSession>[1] = {
 		tools, systemPrompt: "Use tools.", contextWindow: 100_000,
 		stream: async (context, { tools: declared }) => {
 			if (!summaryCalled) {
@@ -279,8 +282,8 @@ test("compaction summarizes tool activity and retains the recent call and result
 			return assistant("continuing");
 		},
 	};
-	await new ChatSession(store, options).compact(() => {});
-	assert.equal(messageText(await new ChatSession(store, options).send("next", () => {})), "continuing");
+	await new AgentSession(store, options).compact(() => {});
+	assert.equal(messageText(await new AgentSession(store, options).prompt("next", () => {})), "continuing");
 });
 
 test("readline shows a tool call, completion and final text in order", (t) => {
@@ -302,7 +305,7 @@ test("readline shows a tool call, completion and final text in order", (t) => {
 	const main = fileURLToPath(new URL("../src/main.ts", import.meta.url));
 	const child = spawnSync(process.execPath, ["--import", importUrl, main], {
 		cwd, input: "Read the example\n/exit\n", encoding: "utf8", timeout: 15_000,
-		env: { ...process.env, DEEPSEEK_API_KEY: "fake", TI_HOME: join(cwd, "auth"),
+		env: { ...process.env, TI_PROVIDER: "deepseek", DEEPSEEK_API_KEY: "fake", TI_HOME: join(cwd, "auth"),
 			TI_SESSION_HOME: join(cwd, "data"), TI_LEGACY_HOME: "" },
 	});
 	assert.ifError(child.error);

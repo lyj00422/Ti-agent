@@ -1,48 +1,52 @@
-import { resolve } from "node:path";
-import { ChatSession } from "./session/chat-session.ts";
-import type { ChatSessionOptions } from "./session/chat-session.ts";
-import type { SessionStore } from "./session/store.ts";
-import { loadToolExtensions } from "./tools/extensions.ts";
-import { createCoreTools } from "./tools/index.ts";
-import { connectMcpServers } from "./tools/mcp-client.ts";
+import { AgentSession } from "./session/agent-session.ts";
+import type { Agent } from "./agent/agent.ts";
+import type { AgentSessionOptions } from "./session/agent-session.ts";
+import type { SessionRepository } from "./session/store.ts";
+import { DefaultAgentResourceLoader } from "./tools/resource-loader.ts";
+import type { AgentResourceLoader } from "./tools/resource-loader.ts";
 import type { ToolDefinition } from "./tools/registry.ts";
+import type { ModelRegistrationAPI } from "./providers/types.ts";
 
 export { SessionStore } from "./session/store.ts";
+export { Agent } from "./agent/agent.ts";
 export { defineTool, Type } from "./tools/extensions.ts";
 export { registerMcpTools } from "./tools/mcp.ts";
+export { createModelRuntime } from "./providers/model-runtime.ts";
 export type { ExtensionAPI, ToolDefinition } from "./tools/extensions.ts";
 export type { McpTool, McpToolClient, McpToolResult } from "./tools/mcp.ts";
 export type { McpServerConfig } from "./tools/mcp-client.ts";
-export type { StreamReply } from "./agent/messages.ts";
-export type { ChatEvent } from "./session/chat-session.ts";
+export type { AgentResourceLoader, AgentResourceLoadOptions, LoadedAgentResources } from "./tools/resource-loader.ts";
+export type { AgentSessionEvent } from "./session/agent-session.ts";
+export type { SessionRepository } from "./session/store.ts";
+export type { ModelRuntime, ModelRuntimeOptions } from "./providers/model-runtime.ts";
+export type { ModelDefinition, ModelDescriptor, ModelProvider, ModelRegistrationAPI, ModelStream, ProviderConfig, ProviderStream } from "./providers/types.ts";
 
-export interface CreateAgentSessionOptions extends Omit<ChatSessionOptions, "tools"> {
+export interface CreateAgentSessionOptions extends Omit<AgentSessionOptions, "tools"> {
 	cwd: string;
-	store: SessionStore;
+	store: SessionRepository;
 	customTools?: readonly ToolDefinition[];
 	extensionPaths?: readonly string[];
 	activeTools?: readonly string[];
 	mcpServers?: Readonly<Record<string, unknown>>;
 	onMcpWarning?: (message: string) => void;
+	resourceLoader?: AgentResourceLoader;
+	modelRegistry?: ModelRegistrationAPI;
 	signal?: AbortSignal;
 }
 
-export async function createAgentSession(options: CreateAgentSessionOptions): Promise<{ session: ChatSession; dispose: () => Promise<void> }> {
+export async function createAgentSession(options: CreateAgentSessionOptions): Promise<{ agent: Agent; session: AgentSession; dispose: () => Promise<void> }> {
 	const {
 		cwd: directory, store, customTools = [], extensionPaths = [], activeTools, mcpServers = {},
-		onMcpWarning = (message) => process.emitWarning(message), signal, ...sessionOptions
+		onMcpWarning, resourceLoader = new DefaultAgentResourceLoader(), modelRegistry, signal, ...sessionOptions
 	} = options;
-	const cwd = resolve(directory);
-	const tools = createCoreTools(cwd);
-	await loadToolExtensions(tools, cwd, extensionPaths);
-	for (const tool of customTools) tools.register(tool, { type: "sdk" });
-	const dispose = await connectMcpServers(tools, cwd, mcpServers, onMcpWarning, signal);
+	const resources = await resourceLoader.load({
+		cwd: directory, customTools, extensionPaths, activeTools, mcpServers, onMcpWarning, modelRegistry, signal,
+	});
 	try {
-		signal?.throwIfAborted();
-		if (activeTools) tools.setActiveTools(activeTools);
-		return { session: new ChatSession(store, { ...sessionOptions, tools }), dispose };
+		const session = new AgentSession(store, { ...sessionOptions, tools: resources.tools });
+		return { agent: session.runtime, session, dispose: resources.dispose };
 	} catch (error) {
-		await dispose();
+		await resources.dispose();
 		throw error;
 	}
 }

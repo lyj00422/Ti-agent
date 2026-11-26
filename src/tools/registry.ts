@@ -24,6 +24,7 @@ export interface ToolDefinition<Schema extends TSchema = TSchema, Details = unkn
 	promptGuidelines?: readonly string[];
 	outputSchema?: TSchema;
 	constrainedSampling?: { type: "json_schema"; strict: "prefer" };
+	executionMode?: "parallel" | "sequential";
 	defaultActive?: boolean;
 	prepareArguments?: (args: unknown) => Static<Schema>;
 	execute(
@@ -77,6 +78,7 @@ export type ToolHook<Name extends ToolHookName> = (
 interface RegisteredTool {
 	info: ToolInfo;
 	prompt: string[];
+	executionMode: "parallel" | "sequential";
 	prepare: (input: ToolArguments) => ToolArguments;
 	validate: (input: ToolArguments) => void;
 	execute: (id: string, input: ToolArguments, signal: AbortSignal, onUpdate?: (result: ToolResult) => void) => Promise<ToolResult>;
@@ -85,6 +87,7 @@ interface RegisteredTool {
 export interface ToolSnapshot {
 	declarations: readonly ToolDeclaration[];
 	prompt: readonly string[];
+	executionMode: "parallel" | "sequential";
 	execute: (call: ToolCall, signal: AbortSignal, onUpdate?: (result: ToolResult) => void) => Promise<ToolResult>;
 }
 
@@ -132,6 +135,7 @@ export class ToolRegistry {
 		const parameters = structuredClone(tool.parameters);
 		return {
 			info: { name, label, description, parameters, source, exposure: source.type === "mcp" ? source.exposure : "direct" },
+			executionMode: tool.executionMode ?? "parallel",
 			prompt: [
 				...(tool.promptSnippet ? [`- ${name}: ${tool.promptSnippet}`] : []),
 				...(tool.promptGuidelines ?? []),
@@ -197,6 +201,7 @@ export class ToolRegistry {
 				name, description, parameters: structuredClone(parameters),
 			})),
 			prompt: [...tools.values()].flatMap((tool) => tool.prompt),
+			executionMode: [...tools.values()].some((tool) => tool.executionMode === "sequential") ? "sequential" : "parallel",
 			execute: async (call, signal, onUpdate) => {
 				signal.throwIfAborted();
 				if (call.argumentError) throw new Error(call.argumentError);

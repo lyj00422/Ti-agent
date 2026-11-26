@@ -12,7 +12,8 @@ import type { TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 import { createAgentSession, registerMcpTools, SessionStore } from "../src/sdk.ts";
 import { messageText } from "../src/agent/messages.ts";
-import type { AssistantMessage, StreamReply, ToolCall } from "../src/agent/messages.ts";
+import type { AssistantMessage, ToolCall } from "../src/agent/messages.ts";
+import type { ModelStream } from "../src/providers/types.ts";
 
 const main = fileURLToPath(new URL("../src/main.ts", import.meta.url));
 const stdioFixture = fileURLToPath(new URL("./mcp-stdio-fixture.ts", import.meta.url));
@@ -25,7 +26,7 @@ function fixture(t: TestContext) {
 	mkdirSync(home);
 	t.after(() => rm(cwd, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 }));
 	return { cwd, home, store: new SessionStore(data, [], cwd),
-		env: { ...process.env, TI_HOME: home, TI_SESSION_HOME: data, TI_LEGACY_HOME: "", DEEPSEEK_API_KEY: "mock",
+		env: { ...process.env, TI_HOME: home, TI_SESSION_HOME: data, TI_LEGACY_HOME: "", TI_PROVIDER: "deepseek", DEEPSEEK_API_KEY: "mock",
 			TI_FIXTURE_SECRET: "fixture-value" } };
 }
 
@@ -244,7 +245,7 @@ test("deferred tools activate on the next request and survive session restore an
 	const reply = (text: string, calls: ToolCall[] = []): AssistantMessage => ({ role: "assistant", timestamp: Date.now(),
 		content: calls.length ? calls : [{ type: "text", text }], stopReason: calls.length ? "toolUse" : "stop" });
 	let step = 0;
-	const stream: StreamReply = async (messages, { tools }) => {
+	const stream: ModelStream = async (messages, { tools }) => {
 		if (!tools) return reply("Earlier conversation used echo");
 		const names = tools.map(({ name }) => name);
 		assert.ok(!names.includes(hidden));
@@ -266,8 +267,8 @@ test("deferred tools activate on the next request and survive session restore an
 	const runtime = await createAgentSession({ ...base, mcpServers, stream });
 	try {
 		assert.throws(() => runtime.session.tools?.setActiveTools([hidden]), /隐藏/);
-		await runtime.session.send("find and use echo", () => {});
-		await runtime.session.send("later turn", () => {});
+		await runtime.session.prompt("find and use echo", () => {});
+		await runtime.session.prompt("later turn", () => {});
 		await runtime.session.compact(() => {});
 		assert.equal(step, 4);
 		const stored = store.list()[0];
@@ -284,12 +285,12 @@ test("deferred tools activate on the next request and survive session restore an
 		return reply("done");
 	} });
 	try {
-		await resumed.session.send("restart", () => {});
+		await resumed.session.prompt("restart", () => {});
 		const saved = store.list()[0];
 		resumed.session.newSession();
-		await resumed.session.send("fresh", () => {});
+		await resumed.session.prompt("fresh", () => {});
 		resumed.session.resume(saved);
-		await resumed.session.send("resume", () => {});
+		await resumed.session.prompt("resume", () => {});
 	} finally {
 		await resumed.dispose();
 	}
@@ -307,7 +308,7 @@ test("deferred tools activate on the next request and survive session restore an
 		} });
 		try {
 			changed.session.resume(discovered);
-			await changed.session.send("check old discoveries", () => {});
+			await changed.session.prompt("check old discoveries", () => {});
 		} finally {
 			await changed.dispose();
 		}
@@ -343,7 +344,7 @@ test("a 50-tool server adds only ranked matches to the model request", async (t)
 			},
 		}, "deferred");
 		registry.setActiveTools(["tool_search"]);
-		assert.equal(messageText(await runtime.session.send("Find page 49", () => {})), "done");
+		assert.equal(messageText(await runtime.session.prompt("Find page 49", () => {})), "done");
 		assert.deepEqual(called, []);
 	} finally {
 		await runtime.dispose();
