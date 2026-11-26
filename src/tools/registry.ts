@@ -1,18 +1,25 @@
 import type { Static, TSchema } from "typebox";
+import { randomUUID } from "node:crypto";
 import { Check, Errors } from "typebox/value";
 import { errorMessage } from "../agent/messages.ts";
 import type { ImageContent, TextContent, ToolCall, ToolDeclaration } from "../agent/messages.ts";
+import type { ToolExecutorSnapshot, ToolExecutionResult } from "../agent/contracts.ts";
+import type { ToolApprovalHandler } from "./permissions.ts";
 import { createToolSearch, TOOL_SEARCH_NAME } from "./tool-search.ts";
 
-export interface ToolResult<Details = unknown> {
-	content: Array<TextContent | ImageContent>;
+export interface ToolResult<Details = unknown> extends ToolExecutionResult {
 	details?: Details;
-	structuredContent?: unknown;
-	isError?: boolean;
 }
 
 export interface ToolContext {
 	readonly cwd: string;
+	getCodemodeTools: () => ToolInfo[];
+	executeTool: (
+		name: string,
+		input: Record<string, unknown>,
+		signal: AbortSignal,
+		parentToolCallId?: string,
+	) => Promise<ToolResult>;
 }
 
 export interface ToolDefinition<Schema extends TSchema = TSchema, Details = unknown> {
@@ -36,7 +43,7 @@ export interface ToolDefinition<Schema extends TSchema = TSchema, Details = unkn
 	): Promise<ToolResult<Details>>;
 }
 
-export type ToolExposure = "direct" | "deferred" | "hidden";
+export type ToolExposure = "direct" | "deferred" | "codemode" | "hidden";
 
 export type ToolSource =
 	| { type: "builtin" }
@@ -57,6 +64,7 @@ export interface ToolCallEvent {
 	toolName: string;
 	toolCallId: string;
 	input: ToolArguments;
+	parentToolCallId?: string;
 }
 
 export interface ToolResultEvent extends ToolResult {
@@ -84,11 +92,11 @@ interface RegisteredTool {
 	execute: (id: string, input: ToolArguments, signal: AbortSignal, onUpdate?: (result: ToolResult) => void) => Promise<ToolResult>;
 }
 
-export interface ToolSnapshot {
-	declarations: readonly ToolDeclaration[];
-	prompt: readonly string[];
-	executionMode: "parallel" | "sequential";
-	execute: (call: ToolCall, signal: AbortSignal, onUpdate?: (result: ToolResult) => void) => Promise<ToolResult>;
+export type ToolSnapshot = ToolExecutorSnapshot;
+
+export interface ToolRegistryOptions {
+	permissionMode?: "ask" | "allow";
+	requestApproval?: ToolApprovalHandler;
 }
 
 export class ToolRegistry {
@@ -96,9 +104,17 @@ export class ToolRegistry {
 	private readonly active = new Set<string>();
 	private readonly hooks: { [Name in ToolHookName]: ToolHook<Name>[] } = { tool_call: [], tool_result: [] };
 	private readonly context: ToolContext;
+	private readonly permissionMode: "ask" | "allow";
+	private readonly requestApproval?: ToolApprovalHandler;
 
-	constructor(cwd = process.cwd()) {
-		this.context = Object.freeze({ cwd });
+	constructor(cwd = process.cwd(), options: ToolRegistryOptions = {}) {
+		this.permissionMode = options.permissionMode ?? "ask";
+		this.requestApproval = options.requestApproval;
+		this.context = Object.freeze({
+			cwd,
+			getCodemodeTools: this.getCodemodeTools.bind(this),
+			executeTool: this.executeNested.bind(this),
+		});
 	}
 
 	register<Schema extends TSchema, Details>(
@@ -151,12 +167,98 @@ export class ToolRegistry {
 		};
 	}
 
+	private async executeNested(name: string, input: ToolArguments, signal: AbortSignal, parentToolCallId?: string): Promise<ToolResult> {
+		const tool = this.tools.get(name);
+		if (!tool || !this.isCodemodeCallable(tool)) {
+			throw new Error("工具不可由 Codemode 调用 " + name);
+		}
+		const call: ToolCall = {
+			type: "toolCall",
+			id: `${parentToolCallId ?? "codemode"}/${randomUUID()}`,
+			name,
+			arguments: input,
+		};
+		return this.executeRegistered(tool, call, signal, undefined, parentToolCallId);
+	}
+
+	private async executeRegistered(
+		tool: RegisteredTool,
+		call: ToolCall,
+		signal: AbortSignal,
+		onUpdate?: (result: ToolResult) => void,
+		parentToolCallId?: string,
+	): Promise<ToolResult> {
+		signal.throwIfAborted();
+		if (call.argumentError) throw new Error(call.argumentError);
+		const identity = { toolName: call.name, toolCallId: call.id, parentToolCallId };
+		let input = tool.prepare(structuredClone(call.arguments));
+		tool.validate(input);
+		let result: ToolResult | undefined;
+		if (this.hooks.tool_call.length) {
+			const event: ToolCallEvent = { type: "tool_call", ...identity, input };
+			for (const handler of this.hooks.tool_call) {
+				signal.throwIfAborted();
+				const outcome = await handler(event, this.context);
+				if (outcome?.block) {
+					result = { content: [{ type: "text", text: outcome.reason ?? "工具调用已被扩展拦截。" }], isError: true };
+					break;
+				}
+			}
+			input = event.input;
+			if (!result) tool.validate(input);
+		}
+		if (!result && this.permissionMode === "ask") {
+			const approved = this.requestApproval
+				? await this.requestApproval({ id: call.id, toolName: call.name, input, parentToolCallId }, signal)
+				: false;
+			if (!approved) result = { content: [{ type: "text", text: "用户拒绝了工具调用。" }], isError: true, terminate: true };
+		}
+		signal.throwIfAborted();
+		if (!result) {
+			let running = true;
+			const publish = onUpdate && ((update: ToolResult) => {
+				if (running && !signal.aborted) onUpdate(update);
+			});
+			try {
+				result = await tool.execute(call.id, input, signal, publish, this.context);
+			} catch (error) {
+				if (signal.aborted || !this.hooks.tool_result.length) throw error;
+				result = { content: [{ type: "text", text: errorMessage(error) }], isError: true };
+			} finally {
+				running = false;
+			}
+		}
+		for (const handler of this.hooks.tool_result) {
+			signal.throwIfAborted();
+			const event: ToolResultEvent = { ...result, type: "tool_result", ...identity, input, isError: result.isError === true };
+			const patch = await handler(event, this.context);
+			if (patch) {
+				result = { ...result, ...patch };
+				if (patch.content !== undefined && patch.structuredContent === undefined) delete result.structuredContent;
+			}
+		}
+		return result;
+	}
+
 	on<Name extends ToolHookName>(type: Name, handler: ToolHook<Name>): void {
 		this.hooks[type].push(handler);
 	}
 
 	getAllTools(): ToolInfo[] {
 		return [...this.tools.values()].map(({ info }) => structuredClone(info));
+	}
+
+	getCodemodeTools(): ToolInfo[] {
+		return [...this.tools.values()]
+			.filter((tool) => this.isCodemodeCallable(tool))
+			.map(({ info }) => structuredClone(info));
+	}
+
+	private isCodemodeCallable(tool: RegisteredTool): boolean {
+		const { info } = tool;
+		if (info.name === "codemode" || info.exposure === "hidden") return false;
+		if (info.source.type === "mcp") return info.exposure === "codemode" || info.exposure === "deferred" || this.active.has(info.name);
+		return this.active.has(info.name);
 	}
 
 	getActiveTools(): string[] {
@@ -171,6 +273,13 @@ export class ToolRegistry {
 		}
 		this.active.clear();
 		for (const name of names) this.active.add(name);
+	}
+
+	activate(name: string): void {
+		const tool = this.tools.get(name);
+		if (!tool) throw new Error("当前未注册工具 " + name);
+		if (tool.info.exposure === "hidden") throw new Error("工具已隐藏 " + name);
+		this.active.add(name);
 	}
 
 	declarations(): readonly ToolDeclaration[] {
@@ -194,62 +303,16 @@ export class ToolRegistry {
 			}
 		}
 		if (searchEnabled) tools.set(TOOL_SEARCH_NAME, this.bind(createToolSearch(candidates), { type: "builtin" }));
-		const before = [...this.hooks.tool_call];
-		const after = [...this.hooks.tool_result];
 		return {
 			declarations: [...tools.values()].map(({ info: { name, description, parameters } }) => ({
 				name, description, parameters: structuredClone(parameters),
 			})),
 			prompt: [...tools.values()].flatMap((tool) => tool.prompt),
 			executionMode: [...tools.values()].some((tool) => tool.executionMode === "sequential") ? "sequential" : "parallel",
-			execute: async (call, signal, onUpdate) => {
-				signal.throwIfAborted();
-				if (call.argumentError) throw new Error(call.argumentError);
+			execute: async (call, signal, onUpdate, parentToolCallId) => {
 				const tool = tools.get(call.name);
 				if (!tool) throw new Error("该请求未注册工具 " + call.name);
-				const identity = { toolName: call.name, toolCallId: call.id };
-				let input = tool.prepare(structuredClone(call.arguments));
-				tool.validate(input);
-				let result: ToolResult | undefined;
-				if (before.length) {
-					const event: ToolCallEvent = { type: "tool_call", ...identity, input };
-					for (const handler of before) {
-						signal.throwIfAborted();
-						const outcome = await handler(event, this.context);
-						if (outcome?.block) {
-							result = { content: [{ type: "text", text: outcome.reason ?? "工具调用已被扩展拦截。" }], isError: true };
-							break;
-						}
-					}
-					input = event.input;
-					if (!result) tool.validate(input);
-				}
-				signal.throwIfAborted();
-				if (!result) {
-					let running = true;
-					const publish = onUpdate && ((update: ToolResult) => {
-						if (running && !signal.aborted) onUpdate(update);
-					});
-					try {
-						result = await tool.execute(call.id, input, signal, publish);
-					} catch (error) {
-						if (signal.aborted || !after.length) throw error;
-						result = { content: [{ type: "text", text: errorMessage(error) }], isError: true };
-					} finally {
-						running = false;
-					}
-				}
-				for (const handler of after) {
-					signal.throwIfAborted();
-					const event: ToolResultEvent = { ...result, type: "tool_result", ...identity, input, isError: result.isError === true };
-					const patch = await handler(event, this.context);
-					if (patch) {
-						// Match Pi when a hook replaces content without supplying matching structured content.
-						result = { ...result, ...patch };
-						if (patch.content !== undefined && patch.structuredContent === undefined) delete result.structuredContent;
-					}
-				}
-				return result;
+				return this.executeRegistered(tool, call, signal, onUpdate, parentToolCallId);
 			},
 		};
 	}

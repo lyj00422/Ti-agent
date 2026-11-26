@@ -1,6 +1,6 @@
 import { toolCalls } from "./messages.ts";
 import type { AssistantMessage, ChatMessage, ToolCall, ToolResultMessage } from "./messages.ts";
-import type { ToolResult, ToolSnapshot } from "../tools/registry.ts";
+import type { ToolExecutionResult, ToolExecutorSnapshot } from "./contracts.ts";
 
 export type AgentEvent =
 	| { type: "agent_start" | "agent_end" | "turn_start" }
@@ -9,12 +9,12 @@ export type AgentEvent =
 	| { type: "message_update"; event: { type: "text_delta"; text: string } | { type: "usage"; usage: NonNullable<AssistantMessage["usage"]> } }
 	| { type: "message_end"; message: ChatMessage }
 	| { type: "tool_execution_start"; call: ToolCall }
-	| { type: "tool_execution_update"; call: ToolCall; partialResult: ToolResult }
+	| { type: "tool_execution_update"; call: ToolCall; partialResult: ToolExecutionResult }
 	| { type: "tool_execution_end"; call: ToolCall; result: ToolResultMessage };
 
 export interface AgentRunOptions {
 	initialMessage?: ChatMessage;
-	request: (signal: AbortSignal) => Promise<{ reply: AssistantMessage; tools?: ToolSnapshot }>;
+	request: (signal: AbortSignal) => Promise<{ reply: AssistantMessage; tools?: ToolExecutorSnapshot }>;
 	commit: (message: ChatMessage) => void;
 	signal?: AbortSignal;
 	finishTurn?: (message: AssistantMessage, signal: AbortSignal) => Promise<"continue" | "end" | undefined>;
@@ -51,6 +51,16 @@ export class Agent {
 		return "queued";
 	}
 
+	clearQueue(): { steering: string[]; followUp: string[] } {
+		const steering = this.steering.splice(0);
+		const followUp = this.followUps.splice(0);
+		return { steering, followUp };
+	}
+
+	get pendingMessageCount(): number {
+		return this.steering.length + this.followUps.length;
+	}
+
 	abort(): void {
 		this.active?.controller.abort();
 	}
@@ -76,10 +86,9 @@ export class Agent {
 	private async runLoop(options: AgentRunOptions, signal: AbortSignal): Promise<AssistantMessage> {
 		await this.emit({ type: "agent_start" });
 		let last: AssistantMessage | undefined;
-		let needsContinuation = false;
 		try {
 			if (options.initialMessage) await this.publishMessage(options.initialMessage, options.commit);
-			for (let turn = 0; turn < 32 && !signal.aborted; turn++) {
+			while (!signal.aborted) {
 				await this.emit({ type: "turn_start" });
 				const { reply, tools } = await options.request(signal);
 				await this.pendingEvents;
@@ -90,21 +99,17 @@ export class Agent {
 				if (signal.aborted || reply.stopReason === "error" || reply.stopReason === "aborted") break;
 				const decision = await options.finishTurn?.(reply, signal);
 				if (decision === "end") break;
-				const queued = this.steering.shift() ?? this.followUps.shift();
+				if (results.length > 0 && results.every((result) => result.terminate)) break;
+				const queued = this.steering.shift()
+					?? (reply.stopReason === "toolUse" ? undefined : this.followUps.shift());
 				if (queued !== undefined) {
 					await this.publishMessage({ role: "user", content: [{ type: "text", text: queued }], timestamp: Date.now() }, options.commit);
-					needsContinuation = true;
 					continue;
 				}
-				needsContinuation = decision === "continue" || reply.stopReason === "toolUse";
-				if (!needsContinuation) break;
+				if (decision !== "continue" && reply.stopReason !== "toolUse") break;
 			}
-			if (needsContinuation && !signal.aborted) {
-				last = { role: "assistant", content: [], timestamp: Date.now(), stopReason: "error", errorMessage: "达到本轮 32 轮次上限。" };
-				await this.publishMessage(last, options.commit);
-			} else if (!last || (signal.aborted && last.stopReason !== "aborted")) {
-				last = { role: "assistant", content: [], timestamp: Date.now(), stopReason: signal.aborted ? "aborted" : "error",
-					errorMessage: signal.aborted ? undefined : "达到本轮 32 轮次上限。" };
+			if (!last || (signal.aborted && last.stopReason !== "aborted")) {
+				last = { role: "assistant", content: [], timestamp: Date.now(), stopReason: signal.aborted ? "aborted" : "error" };
 				await this.publishMessage(last, options.commit);
 			}
 			return last;
@@ -116,7 +121,7 @@ export class Agent {
 
 	private async executeTools(
 		message: AssistantMessage,
-		tools: ToolSnapshot | undefined,
+		tools: ToolExecutorSnapshot | undefined,
 		signal: AbortSignal,
 		commit: (message: ChatMessage) => void,
 	): Promise<ToolResultMessage[]> {
@@ -130,7 +135,7 @@ export class Agent {
 				const output = await tools.execute(call, signal, (partialResult) => {
 					void this.publish({ type: "tool_execution_update", call, partialResult });
 				});
-				result = { ...base, ...output, isError: output.isError === true };
+					result = { ...base, ...output, isError: output.isError === true };
 			} catch (error) {
 				result = { ...base, isError: true, content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }] };
 			}

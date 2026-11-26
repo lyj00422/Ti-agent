@@ -6,6 +6,7 @@ import type { AssistantMessage, ToolCall, ToolResultMessage, Usage } from "../ag
 import type { AgentSessionEvent, AgentSession } from "../session/agent-session.ts";
 import type { Session } from "../session/store.ts";
 import type { ModelChoice } from "../providers/model-runtime.ts";
+import type { ToolApprovalBroker, ToolApprovalRequest } from "../tools/permissions.ts";
 
 interface TerminalChatOptions {
 	session: AgentSession;
@@ -17,6 +18,7 @@ interface TerminalChatOptions {
 	getThinking: () => string;
 	thinkingLevels: () => readonly string[];
 	setThinking: (level: string, persist?: boolean) => string;
+	approvals?: ToolApprovalBroker;
 }
 
 export async function startTerminalChat(options: TerminalChatOptions): Promise<void> {
@@ -45,6 +47,9 @@ async function startReadlineChat(options: TerminalChatOptions): Promise<void> {
 	let multiline: string[] = [];
 	let loginProvider: string | undefined;
 	let providerPicker: readonly string[] | undefined;
+	let ignoreApprovalLine = false;
+	let inputClosed = false;
+	let pendingApproval: ToolApprovalRequest | undefined;
 
 	const write = (text: string) => stdout.write(text);
 	const promptForKey = (provider: string) => {
@@ -75,6 +80,28 @@ async function startReadlineChat(options: TerminalChatOptions): Promise<void> {
 		if (event.type === "compacting") write("正在压缩早期对话…\n");
 		if (event.type === "compacted") write("上下文已压缩。\n");
 	};
+	const stopApprovalListener = options.approvals?.subscribe((request) => {
+		pendingApproval = request;
+		if (inputClosed) {
+			pendingApproval = undefined;
+			options.approvals?.respond(request.id, false);
+			return;
+		}
+		write(`批准工具 ${request.toolName} ${JSON.stringify(request.input)}？输入 y 或 n> `);
+		input.once("line", (answer) => {
+			ignoreApprovalLine = true;
+			pendingApproval = undefined;
+			options.approvals?.respond(request.id, /^y(es)?$/i.test(answer.trim()));
+		});
+	});
+	input.once("close", () => {
+		inputClosed = true;
+		if (pendingApproval) {
+			const requestId = pendingApproval.id;
+			pendingApproval = undefined;
+			options.approvals?.respond(requestId, false);
+		}
+	});
 	const respond = async (text: string, retry: boolean) => {
 		let started = false;
 		const endText = () => {
@@ -114,6 +141,10 @@ async function startReadlineChat(options: TerminalChatOptions): Promise<void> {
 		write(`Ti · ${options.getModel()} · /new · /resume · /login · /model · /thinking · /retry · /usage · /compact · /exit\n`);
 		showHistory();
 		for await (const line of input) {
+			if (ignoreApprovalLine) {
+				ignoreApprovalLine = false;
+				continue;
+			}
 			if (exiting) break;
 			const command = line.trim();
 			if (!loginProvider && command === "/exit") break;
@@ -205,6 +236,7 @@ async function startReadlineChat(options: TerminalChatOptions): Promise<void> {
 			}
 		}
 	} finally {
+		stopApprovalListener?.();
 		close();
 		process.off("SIGINT", close);
 		process.off("SIGTERM", close);
@@ -214,7 +246,8 @@ async function startReadlineChat(options: TerminalChatOptions): Promise<void> {
 async function startFullscreenChat(options: TerminalChatOptions): Promise<void> {
 	return new Promise((resolve, reject) => {
 		const { session } = options;
-		let mode: "chat" | "login" | "resume" | "provider" | "model" | "thinking" = "chat";
+		let mode: "chat" | "login" | "resume" | "provider" | "model" | "thinking" | "approval" = "chat";
+		let pendingApproval: ToolApprovalRequest | undefined;
 		let loginProvider = "";
 		let choices: readonly { label: string; value: string }[] = [];
 		let filteredChoices = choices;
@@ -234,6 +267,7 @@ async function startFullscreenChat(options: TerminalChatOptions): Promise<void> 
 		let scrollOffset = 0;
 		let maxScrollOffset = 0;
 		let closed = false;
+		let stopApprovalListener = () => {};
 		const spinner = ["·", "··", "···", "··"];
 		let previousScreen: string[] | undefined;
 
@@ -277,6 +311,11 @@ async function startFullscreenChat(options: TerminalChatOptions): Promise<void> 
 					const detail = styleTerminal("dim", `${item.modified.toLocaleString()} · ${item.history.length} messages`);
 					transcript.push(`${prefix}${index === selectedSession ? styleTerminal("magenta", title) : title}  ${detail}`);
 				}
+				if (mode === "approval" && pendingApproval) {
+					transcript.push("");
+					transcript.push(styleTerminal("yellow", `Approve ${pendingApproval.toolName}?`));
+					transcript.push(...wrapTerminalText(JSON.stringify(pendingApproval.input), width - 4).map((line) => "  " + line));
+				}
 			}
 			if (notice) transcript.push(...wrapTerminalText(notice, width - 2).map((line) => styleTerminal(noticeIsError ? "red" : "dim", "  " + line)));
 
@@ -302,7 +341,8 @@ async function startFullscreenChat(options: TerminalChatOptions): Promise<void> 
 			const footer = `${footerLeft}${" ".repeat(Math.max(1, width - terminalWidth(footerLeft) - terminalWidth(footerRight)))}${footerRight}`;
 			const hints = mode === "login"
 				? `${safeTerminalText(loginProvider)} · Enter save · Esc cancel`
-				: mode === "thinking" ? "↑↓ select · Enter confirm · Ctrl+S save default · Esc cancel"
+					: mode === "approval" ? "Y allow · N deny"
+					: mode === "thinking" ? "↑↓ select · Enter confirm · Ctrl+S save default · Esc cancel"
 				: choosing ? "Search · ↑↓ select · Enter confirm · Esc cancel"
 				: mode === "resume"
 					? "↑↓ select · Enter resume · Esc cancel"
@@ -378,6 +418,7 @@ async function startFullscreenChat(options: TerminalChatOptions): Promise<void> 
 			session.abort();
 			clearInterval(spinnerTimer);
 			stdin.off("keypress", onKeypress);
+			stopApprovalListener();
 			stdin.off("end", close);
 			stdout.off("resize", render);
 			process.off("SIGINT", close);
@@ -393,6 +434,12 @@ async function startFullscreenChat(options: TerminalChatOptions): Promise<void> 
 
 		const submit = () => {
 			const text = draft.trim();
+			if (mode === "approval" && pendingApproval) {
+				options.approvals?.respond(pendingApproval.id, /^y(es)?$/i.test(text));
+				pendingApproval = undefined;
+				setMode("chat");
+				return;
+			}
 			if (mode === "login") {
 				if (!text) {
 					setMode("chat");
@@ -558,6 +605,18 @@ async function startFullscreenChat(options: TerminalChatOptions): Promise<void> 
 				return;
 			}
 			if (session.isRunning) {
+				if (mode === "approval" && pendingApproval) {
+					if (char?.toLowerCase() === "y") {
+						options.approvals?.respond(pendingApproval.id, true);
+						pendingApproval = undefined;
+						setMode("chat");
+					} else if (char?.toLowerCase() === "n" || key.name === "return" || key.name === "enter") {
+						options.approvals?.respond(pendingApproval.id, false);
+						pendingApproval = undefined;
+						setMode("chat");
+					}
+					return;
+				}
 				if (key.name === "escape") session.abort();
 				return;
 			}
@@ -663,6 +722,15 @@ async function startFullscreenChat(options: TerminalChatOptions): Promise<void> 
 				render();
 			}
 		}, 500);
+		if (options.approvals) {
+			stopApprovalListener = options.approvals.subscribe((request) => {
+				pendingApproval = request;
+				mode = "approval";
+				draft = "";
+				cursor = 0;
+				render();
+			});
+		}
 		emitKeypressEvents(stdin);
 		stdin.setRawMode(true);
 		stdin.resume();

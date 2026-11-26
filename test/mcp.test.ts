@@ -25,7 +25,7 @@ function fixture(t: TestContext) {
 	const data = join(cwd, "data");
 	mkdirSync(home);
 	t.after(() => rm(cwd, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 }));
-	return { cwd, home, store: new SessionStore(data, [], cwd),
+	return { cwd, home, store: new SessionStore(data, [], cwd), permissionMode: "allow" as const,
 		env: { ...process.env, TI_HOME: home, TI_SESSION_HOME: data, TI_LEGACY_HOME: "", TI_PROVIDER: "deepseek", DEEPSEEK_API_KEY: "mock",
 			TI_FIXTURE_SECRET: "fixture-value" } };
 }
@@ -59,7 +59,8 @@ function cli({ cwd, env }: Fixture, args: string[], input = "", toolName?: strin
 	const preload = toolName ? ["--import", "data:text/javascript;base64," +
 		Buffer.from(`(${loadMock.toString()})(${JSON.stringify(toolName)}, ${discover})`).toString("base64")] : [];
 	return new Promise<{ code: number | string; stdout: string; stderr: string }>((resolve, reject) => {
-		const child = execFile(process.execPath, [...preload, main, ...args], { cwd, env, timeout: 12_000 }, (error, stdout, stderr) => {
+		const cliArgs = args[0] === "mcp" ? args : [...args, "--yolo"];
+		const child = execFile(process.execPath, [...preload, main, ...cliArgs], { cwd, env, timeout: 12_000 }, (error, stdout, stderr) => {
 			if (error?.killed) reject(error);
 			else resolve({ code: error?.code ?? 0, stdout, stderr });
 		});
@@ -182,7 +183,7 @@ test("mcp add persists a service for normal CLI startup, list probes it and remo
 	const configPath = join(options.home, "mcp.json");
 	const closed = join(options.cwd, "mcp-closed");
 	const tool = "mcp__fixture__echo";
-	const added = await cli(options, ["mcp", "add", "fixture", "--env", "TI_FIXTURE_PREFIX=keep=", "--",
+	const added = await cli(options, ["mcp", "add", "fixture", "--env", "TI_FIXTURE_PREFIX=keep=", "--exposure", "deferred", "--",
 		process.execPath, stdioFixture]);
 	assert.equal(added.code, 0, added.stderr);
 	assert.equal(existsSync(closed), false);
@@ -239,8 +240,12 @@ test("deferred tools activate on the next request and survive session restore an
 	const direct = "mcp__direct__echo";
 	const hidden = "mcp__hidden__echo";
 	const server = { command: process.execPath, args: [stdioFixture], env: { TI_FIXTURE_PREFIX: "echo:" } };
-	const base = { cwd, store, contextWindow: 50_000, keepRecentTokens: 1 };
-	const mcpServers = { deferred: server, direct: { ...server, exposure: "direct" }, hidden: { ...server, exposure: "hidden" } };
+	const base = { cwd, store, contextWindow: 50_000, keepRecentTokens: 1, permissionMode: "allow" as const };
+	const mcpServers = {
+		deferred: { ...server, exposure: "deferred" },
+		direct: { ...server, exposure: "direct" },
+		hidden: { ...server, exposure: "hidden" },
+	};
 	const call = (id: string, name: string, args: Record<string, unknown>): ToolCall => ({ type: "toolCall", id, name, arguments: args });
 	const reply = (text: string, calls: ToolCall[] = []): AssistantMessage => ({ role: "assistant", timestamp: Date.now(),
 		content: calls.length ? calls : [{ type: "text", text }], stopReason: calls.length ? "toolUse" : "stop" });
@@ -297,9 +302,9 @@ test("deferred tools activate on the next request and survive session restore an
 	const discovered = store.list().find(({ title }) => title === "find and use echo");
 	assert.ok(discovered);
 	for (const servers of [
-		{ another: server },
-		{ another: server, deferred: { ...server, enabled: false } },
-		{ another: server, deferred: { ...server, exposure: "hidden" } },
+		{ another: { ...server, exposure: "deferred" } },
+		{ another: { ...server, exposure: "deferred" }, deferred: { ...server, enabled: false } },
+		{ another: { ...server, exposure: "deferred" }, deferred: { ...server, exposure: "hidden" } },
 	]) {
 		const changed = await createAgentSession({ ...base, mcpServers: servers, stream: async (_messages, { tools }) => {
 			assert.ok(tools?.some(({ name }) => name === "tool_search"));
@@ -318,7 +323,7 @@ test("deferred tools activate on the next request and survive session restore an
 test("a 50-tool server adds only ranked matches to the model request", async (t) => {
 	const { cwd, store } = fixture(t);
 	const called: string[] = [];
-	const runtime = await createAgentSession({ cwd, store, contextWindow: 100_000, stream: async (messages, { tools }) => {
+	const runtime = await createAgentSession({ cwd, store, contextWindow: 100_000, permissionMode: "allow", stream: async (messages, { tools }) => {
 		const names = tools?.map(({ name }) => name);
 		const last = messages.at(-1)!;
 		if (last.role === "user") {
@@ -346,6 +351,49 @@ test("a 50-tool server adds only ranked matches to the model request", async (t)
 		registry.setActiveTools(["tool_search"]);
 		assert.equal(messageText(await runtime.session.prompt("Find page 49", () => {})), "done");
 		assert.deepEqual(called, []);
+	} finally {
+		await runtime.dispose();
+	}
+});
+
+test("MCP defaults to codemode and nested calls use the tool approval pipeline", async (t) => {
+	const { cwd, store } = fixture(t);
+	const approved: string[] = [];
+	const stream: ModelStream = async (_messages, { tools }) => {
+		const names = tools?.map(({ name }) => name) ?? [];
+		assert.ok(names.includes("codemode"));
+		assert.ok(!names.includes("mcp__catalog__echo"));
+		if (approved.length === 0) {
+			return { role: "assistant", stopReason: "toolUse", timestamp: 0, content: [
+				{ type: "toolCall", id: "run-code", name: "codemode", arguments: {
+					code: 'const value = await tools.mcp__catalog__echo({ text: "hello" }); text(value);',
+				} },
+			] };
+		}
+		return { role: "assistant", stopReason: "stop", timestamp: 0, content: [{ type: "text", text: "done" }] };
+	};
+	const runtime = await createAgentSession({
+		cwd,
+		store,
+		contextWindow: 100_000,
+		permissionMode: "ask",
+		requestApproval: async (request) => {
+			approved.push(request.toolName);
+			return true;
+		},
+		stream,
+	});
+	try {
+		const registry = runtime.session.tools!;
+		await registerMcpTools(registry, "catalog", {
+			async listTools() { return [{ name: "echo", inputSchema: echoSchema }]; },
+			async callTool(_name, args) { return { content: [{ type: "text", text: "echo:" + args.text }] }; },
+		});
+		const reply = await runtime.session.prompt("use the catalog", () => {});
+		assert.equal(messageText(reply), "done");
+		assert.deepEqual(approved, ["codemode", "mcp__catalog__echo"]);
+		const result = runtime.session.history.find((message) => message.role === "toolResult" && message.toolName === "codemode");
+		assert.equal(result?.role === "toolResult" ? messageText(result) : "", "echo:hello");
 	} finally {
 		await runtime.dispose();
 	}
@@ -387,7 +435,7 @@ test("SDK enforces MCP call timeout and cancellation and can dispose twice", { t
 			response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }));
 		});
 	});
-	const runtime = await createAgentSession({ cwd: options.cwd, store: options.store, contextWindow: 100_000,
+	const runtime = await createAgentSession({ cwd: options.cwd, store: options.store, contextWindow: 100_000, permissionMode: "allow",
 		mcpServers: { slow: { url, timeout: 0.5, exposure: "direct" } }, stream: async () => { throw new Error("Unexpected model request"); } });
 	try {
 		const call: ToolCall = { type: "toolCall", id: "slow-call", name: "mcp__slow__echo", arguments: { text: "hello" } };

@@ -10,9 +10,11 @@
 
 2026-11-25 加入与 Pi 工具层对齐的本地扩展、工具启用列表和执行钩子。扩展通过 `-e` 显式加载，SDK 通过同进程接口注入工具，MCP 通过调用方提供的客户端适配成直接声明的工具。用 `examples/extensions/hello.ts` 和 `test/extensions.test.ts` 可以逐步查看和复现。
 
-2026-11-26 MCP 客户端迁移到 Ti 自己的 `src/tools/mcp-protocol.ts`。CLI 和 SDK 从 `mcp.json` 配置连接 stdio 和 Streamable HTTP 服务，启动时注册发现的工具，退出时关闭连接。项目配置可通过 `--mcp-config` 指定。现有 `test/mcp.test.ts` 覆盖握手、发现、调用和关闭。
+2026-11-27 内核开始按 Agent 循环、上下文会话和工具执行三个边界重整。Agent 对 `ToolExecutorSnapshot` 端口编程，单个 prompt 移除了 32 回合硬上限。工具注册表默认逐次询问，拒绝结果带 `terminate`；TTY 提供本地确认，RPC 客户端可以响应权限请求，`--yolo` 或 SDK 的 `permissionMode: "allow"` 跳过确认。扩展仍在宿主进程运行，由用户自行信任。
 
-Ti 的配置式 MCP 服务默认按需声明。`tool_search` 使用 Pi 的 BM25 排序，搜索结果随工具结果写入会话，从下一次请求起启用。恢复会话时，仍可用的搜索结果会重新进入模型的工具列表。`ti mcp add/list/remove` 管理用户级配置，`list` 实际连接并列出发现的工具。
+MCP `exposure` 默认改为 `codemode`。工具元数据留在内部目录中，模型仅看到 `codemode`，脚本通过 QuickJS/WASM worker 使用 `ALL_TOOLS`、`searchTools()`、`describeTool()` 和 `tools.<name>()`。嵌套工具调用仍通过同一注册表、权限处理与工具钩子。`direct`、`hidden` 保留，`deferred` 和 `tool_search` 继续支持显式按需直接暴露。Codemode 引擎使用独立 `quickjs-wasi`，不导入 Pi runtime。
+
+增加 `--mode rpc` 的 JSONL stdin/stdout 子进程接口，支持 prompt、steer/follow-up、abort、队列清理、状态/消息、模型/思考设置、compact、retry、权限响应和 shutdown，并流式转发 Agent 事件。MCP 仍负责外部工具服务接入，RPC 不提供通用远程工具注册。
 
 ## 项目边界
 
@@ -24,11 +26,11 @@ Ti 是独立 harness。对话轮次、DeepSeek HTTP/SSE、凭据存取、线性 
 
 ## 调用路径
 
-`main.ts` 调用 `src/sdk.ts` 组装内置工具、外部扩展、MCP、模型 Provider 与 `AgentSession`。`Agent` 管理运行和调度，`AgentSession` 提供持久化 transcript、上下文预算和压缩请求。工具快照在每次模型请求时捕获，默认并行执行，声明 sequential 的工具会令整批顺序执行。模型事件由 Agent runtime 统一发布。
+`main.ts` 调用 `src/sdk.ts` 组装内置工具、外部扩展、MCP、模型 Provider 与 `AgentSession`，并选择 TTY 或 RPC 宿主。`Agent` 管理不设固定回合上限的运行循环和输入队列，`AgentSession` 提供持久化 transcript、上下文预算和压缩请求。工具快照在每次模型请求时捕获，默认并行执行，声明 sequential 的工具会令整批顺序执行。工具权限在注册表的执行管线中检查。
 
 `src/agent/messages.ts` 定义文本、图片、工具调用和工具结果。`src/providers/model-registry.ts` 组合三种模型来源，按协议选择内置或扩展流式实现。`src/providers/openai-completions.ts` 按 SSE 索引组装工具参数，并在请求中用 `tool_call_id` 关联结果。图片经过格式转换或缩放后，由适配器随工具结果附上。
 
-`SessionStore` 读写 Ti v3 线性 JSONL，也能读取旧版 v3 文本聊天记录。旧目录会话在首次写入时复制到主目录。`/retry` 从已保存的用户消息或工具结果继续。进程重启后，若末尾有调用缺少结果，会追加同 ID 的「结果未知」记录，供模型先检查现场。压缩保留完整的近期用户轮次，早期工具调用和结果纳入摘要。
+`SessionStore` 读写 Ti v3 线性 JSONL，也能读取旧版 v3 文本聊天记录。旧目录会话在首次写入时复制到主目录。`/retry` 从已保存的用户消息或工具结果继续。进程重启后，若末尾有调用缺少结果，会追加同 ID 的「结果未知」记录，供模型先检查现场。工具结果可记录 `terminate`，供恢复和批次语义判断。压缩保留完整的近期用户轮次，早期工具调用和结果纳入摘要。
 
 上下文估算优先使用压缩后最近一次有效的实际用量，再估算后续消息。缺少基准时按文本 UTF-8 长度近似。`deepseek-flash` 的上下文窗口配置为 100 万 token。Ti 为普通回复预留并限制 16,384 token，保留近期原文的目标是 20,000 token，摘要输出上限为 4,096 token。手动 `/compact` 和发送前自动压缩共用流程。API 明确报告上下文超限时，`/retry` 先尝试压缩再复用原问题。失败、截断或无效摘要不会启用新边界，已上报的摘要用量仍计入累计。
 
@@ -47,7 +49,7 @@ Ti 是独立 harness。对话轮次、DeepSeek HTTP/SSE、凭据存取、线性 
 
 ## 验证
 
-`node --test test/agent.test.ts test/chat.test.ts test/models.test.ts test/tools.test.ts test/extensions.test.ts test/mcp.test.ts` 覆盖 Agent 调度、会话、Ti 自有模型适配器与模型选择、本地扩展、SDK 注入、MCP 注册和传输、图片回传、工具分片、恢复、压缩和终端入口。模型端点使用模拟响应验证。
+`node --test test/agent.test.ts test/chat.test.ts test/tools.test.ts test/extensions.test.ts test/mcp.test.ts test/rpc.test.ts` 覆盖实际变更的 Agent 超过 32 轮、工具授权终止、Codemode 嵌套 MCP 调用、RPC 命令/事件和现有主要会话行为。模型端点使用模拟响应验证。
 
 手动体验时，用 `npm start` 启动 Ti，聊几轮后执行 `/usage` 查看实报用量和上下文估算，再用 `/compact` 压缩早期对话。重启后继续当前会话，可以在 JSONL 中查看完整消息和追加的压缩记录。
 \n

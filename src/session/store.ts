@@ -28,6 +28,7 @@ interface Entry {
 		toolCallId?: string;
 		toolName?: string;
 		isError?: boolean;
+		terminate?: boolean;
 		details?: unknown;
 		structuredContent?: unknown;
 		stopReason?: AssistantMessage["stopReason"];
@@ -219,6 +220,7 @@ export class SessionStore implements SessionRepository {
 			} else if (typeof message.toolCallId === "string" && typeof message.toolName === "string") {
 				history.push({ ...base, role, toolCallId: message.toolCallId, toolName: message.toolName,
 					isError: message.isError === true,
+					...(message.terminate === true ? { terminate: true } : {}),
 					...(message.details === undefined ? {} : { details: message.details }),
 					...(message.structuredContent === undefined ? {} : { structuredContent: message.structuredContent }),
 					content: blocks.filter((block): block is TextContent | ImageContent => isText(block) ||

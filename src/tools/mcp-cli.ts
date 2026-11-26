@@ -6,8 +6,8 @@ import { connectMcpServers, mcpExposure, readMcpConfig, readMcpServers, validate
 import { ToolRegistry } from "./registry.ts";
 
 const usage = [
-	"ti mcp add <name> --url <url> [--header NAME=VALUE] [--exposure deferred|direct|hidden]",
-	"ti mcp add <name> [--cwd <path>] [--env NAME=VALUE] [--exposure deferred|direct|hidden] -- <command> [args...]",
+	"ti mcp add <name> --url <url> [--header NAME=VALUE] [--exposure codemode|deferred|direct|hidden]",
+	"ti mcp add <name> [--cwd <path>] [--env NAME=VALUE] [--exposure codemode|deferred|direct|hidden] -- <command> [args...]",
 	"ti mcp list",
 	"ti mcp remove <name>",
 ].join("\n");

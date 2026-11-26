@@ -25,7 +25,7 @@ function fixture(t: TestContext) {
 	mkdirSync(cwd);
 	// WSL can briefly retain a handle on the search directory after the launcher exits.
 	t.after(() => rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 }));
-	const tools = createCoreTools(cwd);
+	const tools = createCoreTools(cwd, { permissionMode: "allow" });
 	const run = (name: string, args: Record<string, unknown>, signal = new AbortController().signal) =>
 		tools.execute(call(name, args), signal);
 	return { cwd, tools, run, store: new SessionStore(join(root, "data"), [], cwd) };
@@ -303,7 +303,7 @@ test("readline shows a tool call, completion and final text in order", (t) => {
 	};
 	const importUrl = "data:text/javascript;base64," + Buffer.from("globalThis.fetch = " + preload.toString()).toString("base64");
 	const main = fileURLToPath(new URL("../src/main.ts", import.meta.url));
-	const child = spawnSync(process.execPath, ["--import", importUrl, main], {
+	const child = spawnSync(process.execPath, ["--import", importUrl, main, "--yolo"], {
 		cwd, input: "Read the example\n/exit\n", encoding: "utf8", timeout: 15_000,
 		env: { ...process.env, TI_PROVIDER: "deepseek", DEEPSEEK_API_KEY: "fake", TI_HOME: join(cwd, "auth"),
 			TI_SESSION_HOME: join(cwd, "data"), TI_LEGACY_HOME: "" },

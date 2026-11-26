@@ -5,6 +5,7 @@ import { connectMcpServers } from "./mcp-client.ts";
 import { ToolRegistry } from "./registry.ts";
 import type { ToolDefinition } from "./registry.ts";
 import type { ModelRegistrationAPI } from "../providers/types.ts";
+import type { ToolApprovalHandler } from "./permissions.ts";
 
 export interface AgentResourceLoadOptions {
 	cwd: string;
@@ -15,6 +16,8 @@ export interface AgentResourceLoadOptions {
 	signal?: AbortSignal;
 	onMcpWarning?: (message: string) => void;
 	modelRegistry?: ModelRegistrationAPI;
+	permissionMode?: "ask" | "allow";
+	requestApproval?: ToolApprovalHandler;
 }
 
 export interface LoadedAgentResources {
@@ -30,7 +33,10 @@ export interface AgentResourceLoader {
 export class DefaultAgentResourceLoader implements AgentResourceLoader {
 	async load(options: AgentResourceLoadOptions): Promise<LoadedAgentResources> {
 		const cwd = resolve(options.cwd);
-		const tools = createCoreTools(cwd);
+		const tools = createCoreTools(cwd, {
+			permissionMode: options.permissionMode,
+			requestApproval: options.requestApproval,
+		});
 		await loadExtensions(tools, cwd, options.extensionPaths ?? [], options.modelRegistry);
 		for (const tool of options.customTools ?? []) tools.register(tool, { type: "sdk" });
 		const dispose = await connectMcpServers(

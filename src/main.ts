@@ -6,8 +6,10 @@ import { createModelRuntime } from "./providers/model-runtime.ts";
 import { createAgentSession } from "./sdk.ts";
 import { SessionStore } from "./session/store.ts";
 import { startTerminalChat } from "./terminal/chat.ts";
+import { runRpcMode } from "./terminal/rpc.ts";
 import { runMcpCommand } from "./tools/mcp-cli.ts";
 import { readMcpServers } from "./tools/mcp-client.ts";
+import { ToolApprovalBroker } from "./tools/permissions.ts";
 
 async function main(): Promise<void> {
 	const cwd = process.cwd();
@@ -27,9 +29,11 @@ async function main(): Promise<void> {
 	}
 	const { values } = parseArgs({
 		options: {
+			mode: { type: "string" },
 			extension: { type: "string", short: "e", multiple: true },
 			tools: { type: "string" },
 			"mcp-config": { type: "string" },
+				yolo: { type: "boolean" },
 		},
 	});
 	const sessionHome = resolve(process.env.TI_SESSION_HOME || join(cwd, ".ti"));
@@ -48,6 +52,7 @@ async function main(): Promise<void> {
 	const model = createModelRuntime(userHome, { credentialHomes: legacyHome ? [legacyHome] : [] });
 	const configPath = values["mcp-config"];
 	const mcpServers = await readMcpServers(configPath === undefined ? join(userHome, "mcp.json") : resolve(cwd, configPath), configPath === undefined);
+	const approvals = new ToolApprovalBroker();
 	const startup = new AbortController();
 	const stopStartup = () => startup.abort();
 	process.on("SIGINT", stopStartup);
@@ -61,6 +66,8 @@ async function main(): Promise<void> {
 		stream: model.stream,
 		modelRegistry: model,
 		mcpServers,
+		permissionMode: values.yolo ? "allow" : "ask",
+		requestApproval: approvals.request,
 		signal: startup.signal,
 		onMcpWarning: (message) => process.stderr.write(message + "\n"),
 	}).finally(() => {
@@ -69,21 +76,38 @@ async function main(): Promise<void> {
 	});
 
 	try {
-		await startTerminalChat({
-			session: runtime.session,
-			getModel: () => `${model.current.provider}/${model.current.id}`,
-			models: model.list,
-			selectModel: (reference) => {
-				const selected = model.select(reference);
-				return `${selected.provider}/${selected.id}`;
-			},
-			providers: model.providers,
-			login: model.login,
-			getThinking: () => model.thinkingLevel,
-			thinkingLevels: model.thinkingLevels,
-			setThinking: model.setThinking,
-		});
+		const selectModel = (reference: string) => {
+			const selected = model.select(reference);
+			return `${selected.provider}/${selected.id}`;
+		};
+		if (values.mode === "rpc") {
+			await runRpcMode({
+				session: runtime.session, approvals,
+				getModel: () => `${model.current.provider}/${model.current.id}`,
+				models: model.list,
+				selectModel,
+				getThinking: () => model.thinkingLevel,
+				thinkingLevels: model.thinkingLevels,
+				setThinking: model.setThinking,
+			});
+		} else if (values.mode === undefined || values.mode === "interactive") {
+			await startTerminalChat({
+				session: runtime.session,
+				approvals,
+				getModel: () => `${model.current.provider}/${model.current.id}`,
+				models: model.list,
+				selectModel,
+				providers: model.providers,
+				login: model.login,
+				getThinking: () => model.thinkingLevel,
+				thinkingLevels: model.thinkingLevels,
+				setThinking: model.setThinking,
+			});
+		} else {
+			throw new Error(`不支持的运行模式 ${values.mode}`);
+		}
 	} finally {
+		approvals.dispose();
 		await runtime.dispose();
 	}
 }

@@ -63,6 +63,7 @@ export interface ToolResultMessage {
 	details?: unknown;
 	structuredContent?: unknown;
 	isError: boolean;
+	terminate?: boolean;
 	timestamp: number;
 }
 

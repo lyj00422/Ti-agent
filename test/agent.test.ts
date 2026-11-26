@@ -97,17 +97,38 @@ test("a sequential tool forces the whole batch to run in order", async () => {
 	assert.deepEqual(committed.filter((message) => message.role === "toolResult").map((message) => message.toolCallId), ["first", "second"]);
 });
 
-test("a run records an error when it reaches its turn limit", async () => {
+test("a run can continue beyond 32 model turns", async () => {
 	const agent = new Agent();
 	const committed: ChatMessage[] = [];
 	let requests = 0;
 	const result = await agent.run({
 		request: async () => ({ reply: assistant("stop", String(++requests)) }),
 		commit: (message) => committed.push(message),
-		finishTurn: async () => "continue",
+		finishTurn: async () => requests < 40 ? "continue" : undefined,
 	});
-	assert.equal(requests, 32);
-	assert.equal(result.stopReason, "error");
-	assert.match(result.errorMessage ?? "", /32/);
+	assert.equal(requests, 40);
+	assert.equal(result.stopReason, "stop");
+	assert.equal(result.content[0]?.type === "text" ? result.content[0].text : "", "40");
 	assert.equal(committed.at(-1), result);
+});
+
+test("a fully terminating tool batch ends the agent loop", async () => {
+	const agent = new Agent();
+	const committed: ChatMessage[] = [];
+	let requests = 0;
+	const tools: ToolSnapshot = {
+		declarations: [], prompt: [], executionMode: "parallel",
+		async execute() { return { content: [{ type: "text", text: "denied" }], isError: true, terminate: true }; },
+	};
+	const result = await agent.run({
+		request: async () => {
+			requests++;
+			return { reply: { ...assistant("toolUse"), content: [{ type: "toolCall", id: "blocked", name: "blocked", arguments: {} }] }, tools };
+		},
+		commit: (message) => committed.push(message),
+	});
+	assert.equal(requests, 1);
+	assert.equal(result.stopReason, "toolUse");
+	assert.equal(committed.find((message) => message.role === "toolResult")?.role === "toolResult"
+		? committed.find((message) => message.role === "toolResult")?.terminate : false, true);
 });

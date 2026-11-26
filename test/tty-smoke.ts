@@ -47,7 +47,7 @@ const stream: ModelStream = async (context, { signal, onEvent }) => {
 	}
 	return assistant("next answer");
 };
-const tools = createCoreTools(cwd);
+const tools = createCoreTools(cwd, { permissionMode: "allow" });
 tools.register({
 	name: "progress", label: "Progress", description: "Report a long progress line",
 	parameters: Type.Object({}),

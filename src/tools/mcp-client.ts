@@ -94,9 +94,9 @@ export async function readMcpServers(path: string, optional: boolean): Promise<R
 }
 
 export function mcpExposure(value: unknown): ToolExposure {
-	if (value === undefined) return "deferred";
-	if (value === "deferred" || value === "direct" || value === "hidden") return value;
-	throw new Error("exposure 必须是 deferred、direct 或 hidden。");
+	if (value === undefined) return "codemode";
+	if (value === "deferred" || value === "codemode" || value === "direct" || value === "hidden") return value;
+	throw new Error("exposure 必须是 codemode、deferred、direct 或 hidden。");
 }
 
 function resolveVariables(values: Record<string, string> | undefined): Record<string, string> {

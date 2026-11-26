@@ -13,12 +13,13 @@ import { createAgentSession, defineTool, registerMcpTools, SessionStore, Type } 
 import type { AgentSessionEvent, McpToolClient } from "../src/sdk.ts";
 import type { AgentResourceLoader } from "../src/sdk.ts";
 import { ToolRegistry } from "../src/tools/registry.ts";
+import { ToolApprovalBroker } from "../src/tools/permissions.ts";
 
 function fixture(t: TestContext) {
 	const cwd = mkdtempSync(join(tmpdir(), "ti extensions "));
 	const home = join(cwd, "data");
 	t.after(() => rm(cwd, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 }));
-	return { cwd, home, store: new SessionStore(home, [], cwd), contextWindow: 100_000 };
+	return { cwd, home, store: new SessionStore(home, [], cwd), contextWindow: 100_000, permissionMode: "allow" as const };
 }
 
 function call(name: string, args: Record<string, unknown> = {}, id = name): ToolCall {
@@ -52,7 +53,7 @@ test("the CLI loads Pi's hello example, advertises the schema and persists its r
 	const importUrl = "data:text/javascript;base64," + Buffer.from("globalThis.fetch = " + preload.toString()).toString("base64");
 	const main = fileURLToPath(new URL("../src/main.ts", import.meta.url));
 	const extension = fileURLToPath(new URL("../examples/extensions/hello.ts", import.meta.url));
-	const child = spawnSync(process.execPath, ["--import", importUrl, main, "-e", extension, "--tools", "hello"], {
+	const child = spawnSync(process.execPath, ["--import", importUrl, main, "-e", extension, "--tools", "hello", "--yolo"], {
 		cwd, input: "Use hello\n/exit\n", encoding: "utf8", timeout: 15_000,
 		env: { ...process.env, TI_PROVIDER: "deepseek", DEEPSEEK_API_KEY: "fake", TI_HOME: join(cwd, "auth"), TI_SESSION_HOME: home, TI_LEGACY_HOME: "" },
 	});
@@ -303,4 +304,39 @@ test("MCP tools register from an in-memory client and forward calls and cancella
 	controller.abort();
 	await cancelled;
 	assert.deepEqual(calls, ["status-now", "cancel"]);
+});
+
+test("a denied tool call returns a terminating result without execution", async (t) => {
+	const { cwd } = fixture(t);
+	let executed = false;
+	const registry = new ToolRegistry(cwd, {
+		requestApproval: async () => false,
+	});
+	registry.register({
+		name: "write_fixture",
+		label: "Write fixture",
+		description: "",
+		parameters: Type.Object({}),
+		async execute() {
+			executed = true;
+			return { content: [{ type: "text", text: "written" }] };
+		},
+	});
+	const result = await registry.snapshot().execute(call("write_fixture"), new AbortController().signal);
+	assert.equal(executed, false);
+	assert.equal(result.isError, true);
+	assert.equal(result.terminate, true);
+});
+
+test("disposing the approval broker rejects queued requests without dispatching them", async () => {
+	const broker = new ToolApprovalBroker();
+	const dispatched: string[] = [];
+	broker.subscribe((request) => dispatched.push(request.toolName));
+	const signal = new AbortController().signal;
+	const first = broker.request({ id: "first", toolName: "first", input: {} }, signal);
+	const second = broker.request({ id: "second", toolName: "second", input: {} }, signal);
+	broker.dispose();
+	assert.deepEqual(await Promise.all([first, second]), [false, false]);
+	assert.deepEqual(dispatched, ["first"]);
+	assert.equal(await broker.request({ id: "later", toolName: "later", input: {} }, signal), false);
 });

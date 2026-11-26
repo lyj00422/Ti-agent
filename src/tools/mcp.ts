@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { createCodemodeToolDefinition } from "./codemode.ts";
 import type { ImageContent, TextContent } from "../agent/messages.ts";
 import type { ToolDefinition, ToolExposure, ToolRegistry } from "./registry.ts";
 
@@ -27,7 +28,7 @@ const MAX_TOOL_NAME_LENGTH = 64;
 
 // Naming and schema defaults adapted from Pi. See THIRD_PARTY_NOTICES.md.
 export async function registerMcpTools(
-	registry: ToolRegistry, server: string, client: McpToolClient, exposure: ToolExposure = "direct",
+	registry: ToolRegistry, server: string, client: McpToolClient, exposure: ToolExposure = "codemode",
 ): Promise<void> {
 	if (!/^[A-Za-z0-9_-]+$/.test(server)) throw new Error("MCP 服务名无效 " + server);
 	const tools = await client.listTools();
@@ -64,4 +65,8 @@ export async function registerMcpTools(
 		};
 	});
 	for (const definition of definitions) registry.register(definition, { type: "mcp", server, exposure });
+	if (exposure === "codemode") {
+		if (!registry.getAllTools().some(({ name }) => name === "codemode")) registry.register(createCodemodeToolDefinition());
+		registry.activate("codemode");
+	}
 }
