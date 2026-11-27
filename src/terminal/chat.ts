@@ -7,6 +7,7 @@ import type { AgentSessionEvent, AgentSession } from "../session/agent-session.t
 import type { Session } from "../session/store.ts";
 import type { ModelChoice } from "../providers/model-runtime.ts";
 import type { ToolApprovalBroker, ToolApprovalRequest } from "../tools/permissions.ts";
+import { listSlashCommands, resolveWorkflowCommand } from "./commands.ts";
 
 interface TerminalChatOptions {
 	session: AgentSession;
@@ -18,6 +19,8 @@ interface TerminalChatOptions {
 	getThinking: () => string;
 	thinkingLevels: () => readonly string[];
 	setThinking: (level: string, persist?: boolean) => string;
+	getPermissionMode: () => "ask" | "default" | "yolo";
+	setPermissionMode: (mode: "ask" | "default" | "yolo") => string;
 	approvals?: ToolApprovalBroker;
 }
 
@@ -138,7 +141,7 @@ async function startReadlineChat(options: TerminalChatOptions): Promise<void> {
 	};
 
 	try {
-		write(`Ti · ${options.getModel()} · /new · /resume · /login · /model · /thinking · /retry · /usage · /compact · /exit\n`);
+		write(`Ti · ${options.getModel()} · ${options.getPermissionMode()} · /help · /new · /resume · /login · /model · /mode · /retry · /usage · /compact · /exit\n`);
 		showHistory();
 		for await (const line of input) {
 			if (ignoreApprovalLine) {
@@ -147,6 +150,8 @@ async function startReadlineChat(options: TerminalChatOptions): Promise<void> {
 			}
 			if (exiting) break;
 			const command = line.trim();
+			const workflow = multiline.length ? undefined : resolveWorkflowCommand(command);
+			const modeCommand = !multiline.length ? /^\/mode(?:\s+(\S+))?$/.exec(command) : undefined;
 			if (!loginProvider && command === "/exit") break;
 			try {
 				if (loginProvider) {
@@ -191,7 +196,10 @@ async function startReadlineChat(options: TerminalChatOptions): Promise<void> {
 					promptForKey(command.slice(7).trim());
 				} else if (!multiline.length && command === "/model") {
 					modelPicker = options.models();
-					for (const [index, model] of modelPicker.entries()) write(`${index + 1}. ${model.label}\n`);
+					for (const [index, model] of modelPicker.entries()) {
+						const current = `${model.provider}/${model.id}` === options.getModel() ? " · 当前" : "";
+						write(`${index + 1}. ${model.label}${current}\n`);
+					}
 					write("输入编号或 provider/model，直接回车取消\n");
 				} else if (!multiline.length && command.startsWith("/model ")) {
 					write(`当前模型：${options.selectModel(command.slice(7).trim())}\n`);
@@ -199,6 +207,11 @@ async function startReadlineChat(options: TerminalChatOptions): Promise<void> {
 					write(`思考档位 ${options.getThinking()} · 可选 ${options.thinkingLevels().join("、")}\n`);
 				} else if (!multiline.length && command.startsWith("/thinking ")) {
 					write(`思考档位 ${options.setThinking(command.slice(10))}\n`);
+				} else if (modeCommand) {
+					const selected = modeCommand[1];
+					if (!selected) write(`权限模式 ${options.getPermissionMode()} · ask / default / yolo\n`);
+					else if (selected === "ask" || selected === "default" || selected === "yolo") write(`权限模式 ${options.setPermissionMode(selected)}\n`);
+					else errorLine("用法 /mode [ask|default|yolo]");
 				} else if (!multiline.length && command === "/new") {
 					session.newSession();
 					write("已创建新会话\n");
@@ -220,6 +233,12 @@ async function startReadlineChat(options: TerminalChatOptions): Promise<void> {
 					await session.compact(onEvent);
 				} else if (!multiline.length && command === "/retry") {
 					await respond("", true);
+				} else if (workflow?.type === "help") {
+					write(workflow.text + "\n");
+				} else if (workflow?.type === "error") {
+					errorLine(workflow.text);
+				} else if (workflow?.type === "prompt") {
+					await respond(workflow.text, false);
 				} else if (line.endsWith("\\")) {
 					multiline.push(line.slice(0, -1));
 				} else {
@@ -246,12 +265,14 @@ async function startReadlineChat(options: TerminalChatOptions): Promise<void> {
 async function startFullscreenChat(options: TerminalChatOptions): Promise<void> {
 	return new Promise((resolve, reject) => {
 		const { session } = options;
-		let mode: "chat" | "login" | "resume" | "provider" | "model" | "thinking" | "approval" = "chat";
+		let mode: "chat" | "help" | "login" | "resume" | "provider" | "model" | "thinking" | "permission" | "approval" = "chat";
 		let pendingApproval: ToolApprovalRequest | undefined;
 		let loginProvider = "";
-		let choices: readonly { label: string; value: string }[] = [];
+		let choices: readonly { label: string; value: string; description?: string }[] = [];
 		let filteredChoices = choices;
 		let selectedChoice = 0;
+		let commandTokenStart = 0;
+		let commandPaletteOpen = false;
 		let picker: Session[] = [];
 		let selectedSession = 0;
 		let draft = "";
@@ -277,7 +298,7 @@ async function startFullscreenChat(options: TerminalChatOptions): Promise<void> 
 			const width = Math.max(24, stdout.columns || 80);
 			const height = Math.max(10, stdout.rows || 24);
 			const lines: string[] = [];
-			lines.push(` ${styleTerminal(["red", "bold"], "T")}${styleTerminal(["yellow", "bold"], "i")}  ${styleTerminal("dim", "conversation")}`);
+			lines.push(` ${styleTerminal(["red", "bold"], "T")}${styleTerminal(["yellow", "bold"], "i")}  ${styleTerminal("dim", `conversation · ${options.getPermissionMode()}`)}`);
 			lines.push(styleTerminal("magenta", "─".repeat(width)));
 
 			const transcript: string[] = [];
@@ -311,15 +332,16 @@ async function startFullscreenChat(options: TerminalChatOptions): Promise<void> 
 					const detail = styleTerminal("dim", `${item.modified.toLocaleString()} · ${item.history.length} messages`);
 					transcript.push(`${prefix}${index === selectedSession ? styleTerminal("magenta", title) : title}  ${detail}`);
 				}
-				if (mode === "approval" && pendingApproval) {
-					transcript.push("");
-					transcript.push(styleTerminal("yellow", `Approve ${pendingApproval.toolName}?`));
-					transcript.push(...wrapTerminalText(JSON.stringify(pendingApproval.input), width - 4).map((line) => "  " + line));
-				}
+			}
+			if (mode === "approval" && pendingApproval) {
+				transcript.push("");
+				transcript.push(styleTerminal("yellow", `Approve ${pendingApproval.toolName}?`));
+				transcript.push(...wrapTerminalText(JSON.stringify(pendingApproval.input), width - 4).map((line) => "  " + line));
 			}
 			if (notice) transcript.push(...wrapTerminalText(notice, width - 2).map((line) => styleTerminal(noticeIsError ? "red" : "dim", "  " + line)));
 
-			const choosing = mode === "model" || mode === "provider" || mode === "thinking";
+			const commandPopup = mode === "chat" && commandPaletteOpen;
+			const choosing = mode === "help" || mode === "model" || mode === "provider" || mode === "thinking" || mode === "permission";
 			const prompt = mode === "login" ? "Key> " : mode === "model" || mode === "provider" ? "Search> " : "› ";
 			const draftLayout = layoutTerminalDraft(draft, cursor, Math.max(1, width - 4), mode === "login");
 			const hiddenInputRows = Math.max(0, draftLayout.lines.length - Math.max(1, height - 7));
@@ -333,29 +355,52 @@ async function startFullscreenChat(options: TerminalChatOptions): Promise<void> 
 				? `${styleTerminal("magenta", "── ")}${styleTerminal("dim", working)}${styleTerminal("magenta", ` ${"─".repeat(width - terminalWidth(working) - 4)}`)}`
 				: styleTerminal("magenta", "─".repeat(width));
 
-			const thinking = options.thinkingLevels().length > 1 ? " · " + options.getThinking() : "";
-			const footerRight = styleTerminal("magenta", shortenTerminalText(safeTerminalText(options.getModel()) + thinking, width - 2));
-			const latest = liveUsage ?? session.history.findLast((message) => message.role === "assistant")?.usage;
-			const usageLine = latest ? `↑${latest.input} ↓${latest.output} cache ${latest.cacheRead ?? "?"}` : process.cwd();
+			const permissionMode = options.getPermissionMode();
+			const thinkingLevel = options.getThinking();
+			const modelPrefix = `${permissionMode} · `;
+			const thinkingSuffix = ` · ${thinkingLevel}`;
+			const modelWidth = Math.max(1, width - 1 - terminalWidth(modelPrefix) - terminalWidth(thinkingSuffix));
+			const modelLabel = shortenTerminalText(options.getModel(), modelWidth);
+			const footerRight = styleTerminal("magenta", `${modelPrefix}${modelLabel}${thinkingSuffix}`);
+			const { total, contextTokens, contextWindow } = session.usage();
+			const contextPercent = contextWindow > 0 ? Math.round(contextTokens / contextWindow * 100) : 0;
+			const usageParts = total
+				? [`↑${formatTerminalTokens(total.input)}`, `↓${formatTerminalTokens(total.output)}`]
+				: [];
+			if (total?.cacheRead) usageParts.push(`R${formatTerminalTokens(total.cacheRead)}`);
+			usageParts.push(`ctx ${contextPercent}%/${formatTerminalTokens(contextWindow)}`);
+			const usageLine = usageParts.join(" ");
 			const footerLeft = styleTerminal("dim", shortenTerminalText(usageLine, width - terminalWidth(footerRight) - 1));
-			const footer = `${footerLeft}${" ".repeat(Math.max(1, width - terminalWidth(footerLeft) - terminalWidth(footerRight)))}${footerRight}`;
+			const footerGap = Math.max(1, width - terminalWidth(footerLeft) - terminalWidth(footerRight) - 1);
+			const footer = `${footerLeft}${" ".repeat(footerGap)}${footerRight} `;
 			const hints = mode === "login"
 				? `${safeTerminalText(loginProvider)} · Enter save · Esc cancel`
-					: mode === "approval" ? "Y allow · N deny"
-					: mode === "thinking" ? "↑↓ select · Enter confirm · Ctrl+S save default · Esc cancel"
+				: mode === "approval" ? "Y allow · N deny"
+				: mode === "thinking" ? "↑↓ select · Enter confirm · Ctrl+S save default · Esc cancel"
+				: mode === "permission" ? "↑↓ select · Enter confirm · Esc cancel"
+				: commandPopup ? "↑↓ 选择 · Enter 执行 · Tab 补全 · Esc 关闭"
+				: mode === "help" ? "↑↓ 选择 · Enter 执行 · Tab 补全 · Esc 返回"
 				: choosing ? "Search · ↑↓ select · Enter confirm · Esc cancel"
 				: mode === "resume"
 					? "↑↓ select · Enter resume · Esc cancel"
-				: busy ? "Esc stop · Ctrl+C exit" : "/login · /model · Shift+Tab thinking · /thinking · /new · /resume · /exit";
+				: busy ? "Esc stop · Ctrl+C exit" : "";
 
-			const transcriptRows = Math.max(1, height - inputRows.length - 5);
+			const hintRows = hints ? 1 : 0;
+			const popupRows = commandPopup
+				? 1 + Math.min(5, filteredChoices.length) + (filteredChoices.length > 5 ? 1 : 0)
+				: 0;
+			const helpHeadingRows = mode === "help" ? 1 : 0;
+			const transcriptRows = Math.max(1, height - inputRows.length - 4 - hintRows - popupRows - helpHeadingRows);
 			if (choosing) {
-				const start = Math.max(0, selectedChoice - transcriptRows + 1);
-				transcript.splice(0, transcript.length, ...filteredChoices.slice(start, start + transcriptRows).map(({ label }, index) => {
-					const line = shortenTerminalText(safeTerminalText(label), width - 2);
+				const choiceRows = Math.max(1, transcriptRows - helpHeadingRows);
+				const start = Math.max(0, selectedChoice - choiceRows + 1);
+				transcript.splice(0, transcript.length, ...filteredChoices.slice(start, start + choiceRows).map(({ label, description }, index) => {
+					const text = description ? `${label}  ${description}` : label;
+					const line = shortenTerminalText(safeTerminalText(text), width - 2);
 					return start + index === selectedChoice ? styleTerminal("magenta", "› " + line) : "  " + line;
 				}));
-				if (!filteredChoices.length) transcript.push("  No matches");
+				if (mode === "help") transcript.unshift(styleTerminal(["yellow", "bold"], "命令导航"));
+				if (!filteredChoices.length) transcript.push("  没有匹配的命令");
 			}
 			maxScrollOffset = Math.max(0, transcript.length - transcriptRows);
 			scrollOffset = Math.min(scrollOffset, maxScrollOffset);
@@ -365,8 +410,18 @@ async function startFullscreenChat(options: TerminalChatOptions): Promise<void> 
 			lines.push(...visibleTranscript);
 			lines.push(editorBorder);
 			lines.push(...inputRows);
+			if (commandPopup) {
+				lines.push(styleTerminal(["yellow", "bold"], "命令"));
+				const visibleRows = Math.min(5, filteredChoices.length);
+				const firstChoice = Math.max(0, Math.min(selectedChoice - visibleRows + 1, filteredChoices.length - visibleRows));
+				for (const [index, { label, description }] of filteredChoices.slice(firstChoice, firstChoice + visibleRows).entries()) {
+					const row = shortenTerminalText(`${label}  ${description ?? ""}`, width - 2);
+					lines.push(firstChoice + index === selectedChoice ? styleTerminal("magenta", `› ${row}`) : `  ${row}`);
+				}
+				if (filteredChoices.length > visibleRows) lines.push(styleTerminal("dim", `  ${selectedChoice + 1}/${filteredChoices.length}`));
+			}
+			if (hints) lines.push(styleTerminal("dim", shortenTerminalText(hints, width)));
 			lines.push(footer);
-			lines.push(styleTerminal("dim", hints.slice(0, width)));
 			const screen = lines.slice(0, height);
 			while (screen.length < height) screen.push("");
 			const cursorRow = Math.min(height, 4 + transcriptRows + Math.max(0, draftLayout.cursorRow - hiddenInputRows));
@@ -385,18 +440,73 @@ async function startFullscreenChat(options: TerminalChatOptions): Promise<void> 
 
 		const setMode = (next: typeof mode) => {
 			mode = next;
+			commandPaletteOpen = false;
 			draft = "";
 			cursor = 0;
 			notice = "";
 			render();
 		};
 
-		const openChoices = (next: "model" | "provider" | "thinking", items: typeof choices, current?: string) => {
+		const openChoices = (next: "model" | "provider" | "thinking" | "permission", items: typeof choices, current?: string) => {
 			choices = items;
 			filteredChoices = items;
 			selectedChoice = Math.max(0, choices.findIndex(({ value }) => value === current));
 			scrollOffset = 0;
 			setMode(next);
+		};
+
+		const refreshCommandChoices = () => {
+			const commands = listSlashCommands().map(({ name, description }) => ({
+				label: `/${name}`,
+				value: name,
+				description,
+			}));
+			choices = commands;
+			const tokenEnd = draft.indexOf(" ", commandTokenStart);
+			if (draft[commandTokenStart] !== "/" || (tokenEnd >= 0 && cursor > tokenEnd)) {
+				commandPaletteOpen = false;
+				return;
+			}
+			const queryEnd = Math.max(commandTokenStart + 1, Math.min(cursor, tokenEnd < 0 ? draft.length : tokenEnd));
+			const query = draft.slice(commandTokenStart + 1, queryEnd).toLowerCase();
+			const ranked = commands.flatMap((command) => {
+				const score = commandMatchScore(command.value, query);
+				return score < 0 ? [] : [{ command, score }];
+			});
+			ranked.sort((left, right) => right.score - left.score || left.command.value.localeCompare(right.command.value));
+			filteredChoices = ranked.map(({ command }) => command);
+			selectedChoice = Math.min(selectedChoice, Math.max(0, filteredChoices.length - 1));
+			scrollOffset = 0;
+		};
+
+		const openCommandMenu = (input: string, tokenStart: number, cursorPosition = input.length) => {
+			commandPaletteOpen = true;
+			draft = input;
+			cursor = cursorPosition;
+			commandTokenStart = tokenStart;
+			selectedChoice = 0;
+			refreshCommandChoices();
+			notice = "";
+			render();
+		};
+
+		const openHelpPage = () => {
+			commandPaletteOpen = false;
+			choices = listSlashCommands().map(({ name, description }) => ({ label: `/${name}`, value: name, description }));
+			filteredChoices = choices;
+			selectedChoice = 0;
+			scrollOffset = 0;
+			setMode("help");
+		};
+
+		const completeCommand = (value: string, addSpace: boolean) => {
+			const tokenEnd = draft.indexOf(" ", commandTokenStart);
+			const end = tokenEnd < 0 ? draft.length : tokenEnd;
+			const suffix = draft.slice(end);
+			draft = draft.slice(0, commandTokenStart) + `/${value}${addSpace ? " " : ""}` + suffix;
+			cursor = commandTokenStart + value.length + (addSpace ? 2 : 1);
+			commandPaletteOpen = false;
+			render();
 		};
 
 		const applyThinking = (level: string, persist = false) => {
@@ -433,10 +543,39 @@ async function startFullscreenChat(options: TerminalChatOptions): Promise<void> 
 		};
 
 		const submit = () => {
+			if (mode === "chat" && commandPaletteOpen) {
+				const selected = filteredChoices[selectedChoice];
+				if (selected) {
+					completeCommand(selected.value, false);
+					submit();
+				}
+				return;
+			}
 			const text = draft.trim();
+			if (mode === "help") {
+				const selected = filteredChoices[selectedChoice];
+				if (!selected) return;
+				if (selected.value === "help") {
+					openHelpPage();
+					return;
+				}
+				completeCommand(selected.value, false);
+				submit();
+				return;
+			}
 			if (mode === "approval" && pendingApproval) {
 				options.approvals?.respond(pendingApproval.id, /^y(es)?$/i.test(text));
 				pendingApproval = undefined;
+				setMode("chat");
+				return;
+			}
+			if (mode === "permission") {
+				const selected = filteredChoices[selectedChoice];
+				if (selected) {
+					options.setPermissionMode(selected.value as "ask" | "default" | "yolo");
+					notice = `Permission mode: ${selected.value}`;
+					noticeIsError = false;
+				}
 				setMode("chat");
 				return;
 			}
@@ -476,17 +615,36 @@ async function startFullscreenChat(options: TerminalChatOptions): Promise<void> 
 				render();
 				return;
 			}
-			if (text === "/exit") {
+			if (text === "/exit" || text === "/quit") {
 				close();
 				return;
 			}
-			if (text === "/new") {
+			if (text === "/new" || text === "/clear") {
 				session.newSession();
 				scrollOffset = 0;
 				notice = "New session";
 				noticeIsError = false;
 				draft = "";
 				cursor = 0;
+				render();
+				return;
+			}
+			if (text === "/") {
+				openCommandMenu("/", 0);
+				return;
+			}
+			if (text === "/help") {
+				openHelpPage();
+				return;
+			}
+			const workflow = resolveWorkflowCommand(text);
+			if (workflow?.type === "help") {
+				openHelpPage();
+				return;
+			}
+			if (workflow?.type === "error") {
+				notice = workflow.text;
+				noticeIsError = true;
 				render();
 				return;
 			}
@@ -529,7 +687,10 @@ async function startFullscreenChat(options: TerminalChatOptions): Promise<void> 
 				return;
 			}
 			if (text === "/model") {
-				openChoices("model", options.models().map(({ label, provider, id }) => ({ label, value: provider + "/" + id })), options.getModel());
+				openChoices("model", options.models().map(({ label, provider, id }) => ({
+					label: `${label === options.getModel() ? "●" : " "} ${label}`,
+					value: provider + "/" + id,
+				})), options.getModel());
 				return;
 			}
 			if (text.startsWith("/model ")) {
@@ -553,12 +714,32 @@ async function startFullscreenChat(options: TerminalChatOptions): Promise<void> 
 				applyThinking(text.slice(10));
 				return;
 			}
+			if (text === "/mode") {
+				openChoices("permission", (["ask", "default", "yolo"] as const).map((value) => ({
+					label: `${value === options.getPermissionMode() ? "●" : " "} ${value}`,
+					value,
+				})), options.getPermissionMode());
+				return;
+			}
+			if (text.startsWith("/mode ")) {
+				const requested = text.slice(6).trim();
+				if (requested === "ask" || requested === "default" || requested === "yolo") {
+					options.setPermissionMode(requested);
+					notice = `Permission mode: ${requested}`;
+					noticeIsError = false;
+				} else {
+					notice = "Usage: /mode [ask|default|yolo]";
+					noticeIsError = true;
+				}
+				render();
+				return;
+			}
 			draft = "";
 			cursor = 0;
 			scrollOffset = 0;
 			notice = "";
 			noticeIsError = false;
-			if (text === "/usage") {
+			if (text === "/usage" || text === "/cost") {
 				notice = formatUsage(session);
 				render();
 				return;
@@ -581,7 +762,8 @@ async function startFullscreenChat(options: TerminalChatOptions): Promise<void> 
 				}
 				render();
 			};
-			const request = text === "/compact" ? session.compact(onEvent)
+			const request = workflow?.type === "prompt" ? session.prompt(workflow.text, onEvent)
+				: text === "/compact" ? session.compact(onEvent)
 				: text === "/retry" ? session.continue(onEvent)
 					: session.prompt(text, onEvent);
 			render();
@@ -620,19 +802,32 @@ async function startFullscreenChat(options: TerminalChatOptions): Promise<void> 
 				if (key.name === "escape") session.abort();
 				return;
 			}
-			if (mode === "chat" && ((key.name === "tab" && key.shift) || key.sequence === "\x1b[Z")) {
-				const levels = options.thinkingLevels();
-				if (levels.length > 1) {
-					applyThinking(levels[(levels.indexOf(options.getThinking()) + 1) % levels.length]);
-				} else {
-					notice = "Current model has no adjustable thinking level";
-					noticeIsError = false;
-					scrollOffset = 0;
-					render();
+			if (mode === "chat" && (key.name === "tab" || key.sequence === "\x1b[Z")) {
+				if (commandPaletteOpen && !key.shift && key.sequence !== "\x1b[Z") {
+					const selected = filteredChoices[selectedChoice];
+					if (selected) completeCommand(selected.value, true);
+					return;
 				}
+				if (key.shift || key.sequence === "\x1b[Z") {
+					const modes = ["ask", "default", "yolo"] as const;
+					const next = modes[(modes.indexOf(options.getPermissionMode()) + 1) % modes.length];
+					options.setPermissionMode(next);
+					notice = `Permission mode: ${next}`;
+					noticeIsError = false;
+				} else {
+					const levels = options.thinkingLevels();
+					if (levels.length > 1) {
+						applyThinking(levels[(levels.indexOf(options.getThinking()) + 1) % levels.length]);
+					} else {
+						notice = "Current model has no adjustable thinking level";
+						noticeIsError = false;
+						scrollOffset = 0;
+					}
+				}
+				render();
 				return;
 			}
-			if (mode === "model" || mode === "provider" || mode === "thinking") {
+			if (mode === "model" || mode === "provider" || mode === "thinking" || mode === "permission") {
 				if (key.name === "escape") {
 					setMode("chat");
 				} else if (key.name === "up" || key.name === "down") {
@@ -644,11 +839,17 @@ async function startFullscreenChat(options: TerminalChatOptions): Promise<void> 
 					if (selected && mode === "thinking") {
 						setMode("chat");
 						applyThinking(selected.value, key.ctrl && key.name === "s");
+					} else if (selected && mode === "permission") {
+						options.setPermissionMode(selected.value as "ask" | "default" | "yolo");
+						setMode("chat");
+						notice = `Permission mode: ${selected.value}`;
+						noticeIsError = false;
+						render();
 					} else if (selected) {
 						draft = `/${mode === "model" ? "model" : "login"} ${selected.value}`;
 						submit();
 					}
-				} else if (mode !== "thinking" && (key.name === "backspace" || (char && !key.ctrl && !key.meta && !/[\x00-\x1f\x7f]/.test(char)))) {
+				} else if (mode !== "thinking" && mode !== "permission" && (key.name === "backspace" || (char && !key.ctrl && !key.meta && !/[\x00-\x1f\x7f]/.test(char)))) {
 					draft = key.name === "backspace" ? draft.slice(0, previousCharacterOffset(draft, draft.length)) : draft + char;
 					cursor = draft.length;
 					const terms = draft.trim().toLowerCase().split(/\s+/);
@@ -679,6 +880,29 @@ async function startFullscreenChat(options: TerminalChatOptions): Promise<void> 
 				setMode("chat");
 				return;
 			}
+			if (mode === "chat" && commandPaletteOpen && key.name === "escape") {
+				commandPaletteOpen = false;
+				render();
+				return;
+			}
+			if (mode === "help") {
+				if (key.name === "escape") {
+					setMode("chat");
+				} else if (key.name === "up" || key.name === "down") {
+					if (filteredChoices.length) {
+						const step = key.name === "up" ? -1 : 1;
+						selectedChoice = (selectedChoice + step + filteredChoices.length) % filteredChoices.length;
+					}
+					render();
+				} else if (key.name === "tab" || key.name === "return" || key.name === "enter") {
+					const selected = filteredChoices[selectedChoice];
+					if (selected) {
+						completeCommand(selected.value, key.name === "tab");
+						if (key.name !== "tab") submit();
+					}
+				}
+				return;
+			}
 			if (mode === "chat" && (key.sequence === "\n" || key.name === "enter" || (key.ctrl && key.name === "j"))) {
 				draft = draft.slice(0, cursor) + "\n" + draft.slice(cursor);
 				cursor++;
@@ -691,7 +915,14 @@ async function startFullscreenChat(options: TerminalChatOptions): Promise<void> 
 			}
 			if (key.name === "left") cursor = previousCharacterOffset(draft, cursor);
 			else if (key.name === "right") cursor = nextCharacterOffset(draft, cursor);
-			else if (mode === "chat" && (key.name === "up" || key.name === "down") && draft.length === 0) {
+			else if (mode === "chat" && commandPaletteOpen && (key.name === "up" || key.name === "down")) {
+				if (filteredChoices.length) {
+					const step = key.name === "up" ? -1 : 1;
+					selectedChoice = (selectedChoice + step + filteredChoices.length) % filteredChoices.length;
+				}
+				render();
+				return;
+			} else if (mode === "chat" && (key.name === "up" || key.name === "down") && draft.length === 0) {
 				scrollOffset = Math.max(0, Math.min(maxScrollOffset, scrollOffset + (key.name === "up" ? 3 : -3)));
 				render();
 				return;
@@ -705,14 +936,26 @@ async function startFullscreenChat(options: TerminalChatOptions): Promise<void> 
 				const previous = previousCharacterOffset(draft, cursor);
 				draft = draft.slice(0, previous) + draft.slice(cursor);
 				cursor = previous;
+				selectedChoice = 0;
 			} else if (key.name === "delete" && cursor < draft.length) {
 				draft = draft.slice(0, cursor) + draft.slice(nextCharacterOffset(draft, cursor));
+				selectedChoice = 0;
+			} else if (mode === "chat" && char === "/" && !key.ctrl && !key.meta
+				&& (cursor === 0 || /\s/.test(draft[cursor - 1] ?? ""))) {
+				const tokenStart = cursor;
+				draft = draft.slice(0, cursor) + char + draft.slice(cursor);
+				cursor += char.length;
+				openCommandMenu(draft, tokenStart, cursor);
+				return;
 			} else if (char && !key.ctrl && !key.meta && !/[\x00-\x1f\x7f]/.test(char)) {
 				draft = draft.slice(0, cursor) + char + draft.slice(cursor);
 				cursor += char.length;
+				selectedChoice = 0;
+				if (commandPaletteOpen && char === " ") commandPaletteOpen = false;
 			} else {
 				return;
 			}
+			if (commandPaletteOpen) refreshCommandChoices();
 			render();
 		};
 
@@ -778,6 +1021,29 @@ function formatUsage(session: AgentSession): string {
 		`最近回复  ${latest ? format(latest) : "暂无实报用量"}`,
 		`会话累计（已报告）  ${total ? format(total) : "暂无实报用量"}${cacheReadPartial && total?.cacheRead !== undefined ? "（部分请求未报告缓存）" : ""}`,
 	].join("\n");
+}
+
+function formatTerminalTokens(count: number): string {
+	if (count < 1_000) return String(count);
+	if (count < 10_000) return `${(count / 1_000).toFixed(1)}k`;
+	if (count < 1_000_000) return `${Math.round(count / 1_000)}k`;
+	if (count < 10_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
+	return `${Math.round(count / 1_000_000)}M`;
+}
+
+function commandMatchScore(command: string, query: string): number {
+	if (!query) return 100;
+	if (command === query) return 1_100;
+	if (command.startsWith(query)) return 1_000;
+	let matched = 0;
+	let score = 0;
+	for (let index = 0; index < command.length && matched < query.length; index++) {
+		if (command[index] === query[matched]) {
+			score += index === 0 ? 15 : 10;
+			matched++;
+		}
+	}
+	return matched === query.length ? score : -1;
 }
 
 function renderAssistantText(text: string, width: number): string[] {
@@ -936,14 +1202,22 @@ function shortenTerminalText(text: string, width: number): string {
 	return `…${points.slice(start).join("")}`;
 }
 
+const terminalTextSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
 function previousCharacterOffset(text: string, offset: number): number {
-	const previous = text.charCodeAt(offset - 1);
-	return previous >= 0xdc00 && previous <= 0xdfff ? offset - 2 : offset - 1;
+	let previous = 0;
+	for (const part of terminalTextSegmenter.segment(text)) {
+		if (part.index >= offset) return previous;
+		previous = part.index;
+	}
+	return previous;
 }
 
 function nextCharacterOffset(text: string, offset: number): number {
-	const current = text.charCodeAt(offset);
-	return current >= 0xd800 && current <= 0xdbff ? offset + 2 : offset + 1;
+	for (const part of terminalTextSegmenter.segment(text)) {
+		if (part.index >= offset) return part.index + part.segment.length;
+	}
+	return text.length;
 }
 
 function moveTerminalCursorVertically(text: string, cursor: number, direction: -1 | 1): number {

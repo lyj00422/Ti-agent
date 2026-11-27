@@ -37,7 +37,7 @@ export interface CreateAgentSessionOptions extends Omit<AgentSessionOptions, "to
 	resourceLoader?: AgentResourceLoader;
 	modelRegistry?: ModelRegistrationAPI;
 	signal?: AbortSignal;
-	permissionMode?: "ask" | "allow";
+	permissionMode?: "ask" | "default" | "yolo" | "allow";
 	requestApproval?: ToolApprovalHandler;
 }
 

@@ -26,6 +26,7 @@ export interface ToolDefinition<Schema extends TSchema = TSchema, Details = unkn
 	name: string;
 	label: string;
 	description: string;
+	access?: "read" | "write" | "execute";
 	parameters: Schema;
 	promptSnippet?: string;
 	promptGuidelines?: readonly string[];
@@ -85,6 +86,7 @@ export type ToolHook<Name extends ToolHookName> = (
 
 interface RegisteredTool {
 	info: ToolInfo;
+	access: "read" | "write" | "execute";
 	prompt: string[];
 	executionMode: "parallel" | "sequential";
 	prepare: (input: ToolArguments) => ToolArguments;
@@ -95,7 +97,7 @@ interface RegisteredTool {
 export type ToolSnapshot = ToolExecutorSnapshot;
 
 export interface ToolRegistryOptions {
-	permissionMode?: "ask" | "allow";
+	permissionMode?: "ask" | "default" | "yolo" | "allow";
 	requestApproval?: ToolApprovalHandler;
 }
 
@@ -104,11 +106,11 @@ export class ToolRegistry {
 	private readonly active = new Set<string>();
 	private readonly hooks: { [Name in ToolHookName]: ToolHook<Name>[] } = { tool_call: [], tool_result: [] };
 	private readonly context: ToolContext;
-	private readonly permissionMode: "ask" | "allow";
+	private permissionMode: "ask" | "default" | "yolo";
 	private readonly requestApproval?: ToolApprovalHandler;
 
 	constructor(cwd = process.cwd(), options: ToolRegistryOptions = {}) {
-		this.permissionMode = options.permissionMode ?? "ask";
+		this.permissionMode = options.permissionMode === "allow" ? "yolo" : options.permissionMode ?? "default";
 		this.requestApproval = options.requestApproval;
 		this.context = Object.freeze({
 			cwd,
@@ -151,6 +153,7 @@ export class ToolRegistry {
 		const parameters = structuredClone(tool.parameters);
 		return {
 			info: { name, label, description, parameters, source, exposure: source.type === "mcp" ? source.exposure : "direct" },
+			access: tool.access ?? "execute",
 			executionMode: tool.executionMode ?? "parallel",
 			prompt: [
 				...(tool.promptSnippet ? [`- ${name}: ${tool.promptSnippet}`] : []),
@@ -207,7 +210,9 @@ export class ToolRegistry {
 			input = event.input;
 			if (!result) tool.validate(input);
 		}
-		if (!result && this.permissionMode === "ask") {
+		const requiresApproval = this.permissionMode === "ask"
+			|| (this.permissionMode === "default" && tool.access !== "read");
+		if (!result && requiresApproval) {
 			const approved = this.requestApproval
 				? await this.requestApproval({ id: call.id, toolName: call.name, input, parentToolCallId }, signal)
 				: false;
@@ -246,6 +251,14 @@ export class ToolRegistry {
 
 	getAllTools(): ToolInfo[] {
 		return [...this.tools.values()].map(({ info }) => structuredClone(info));
+	}
+
+	getPermissionMode(): "ask" | "default" | "yolo" {
+		return this.permissionMode;
+	}
+
+	setPermissionMode(mode: "ask" | "default" | "yolo"): void {
+		this.permissionMode = mode;
 	}
 
 	getCodemodeTools(): ToolInfo[] {

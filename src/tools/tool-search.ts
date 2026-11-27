@@ -13,6 +13,7 @@ export function createToolSearch(candidates: readonly ToolInfo[]): ToolDefinitio
 	return {
 		name: TOOL_SEARCH_NAME,
 		label: "Tool search",
+		access: "read",
 		description: "Find deferred MCP tools by tool name or capability. Matching tools are available from the next model request. Use English capability terms when descriptions are in English.",
 		parameters,
 		async execute(_id, { query, limit = SEARCH_LIMIT }) {

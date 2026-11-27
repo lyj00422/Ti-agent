@@ -71,6 +71,22 @@ test("the core tools declare schemas and read, edit, write, list, search and fin
 	assert.doesNotMatch(matches, /ignored/);
 });
 
+test("default permissions allow built-in reads, ask before other tools, and yolo allows all", async (t) => {
+	const root = mkdtempSync(join(tmpdir(), "ti permissions "));
+	const cwd = join(root, "project");
+	mkdirSync(cwd);
+	writeFileSync(join(cwd, "source.txt"), "contents");
+	t.after(() => rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 }));
+	const tools = createCoreTools(cwd);
+	const execute = (name: string, args: Record<string, unknown>) => tools.execute(call(name, args), new AbortController().signal);
+
+	assert.equal(tools.getPermissionMode(), "default");
+	assert.notEqual((await execute("read", { path: "source.txt" })).isError, true);
+	assert.equal((await execute("write", { path: "output.txt", content: "new" })).terminate, true);
+	tools.setPermissionMode("yolo");
+	assert.notEqual((await execute("write", { path: "output.txt", content: "new" })).isError, true);
+});
+
 test("the shell tools use the workspace and return failure exit codes and timeouts", async (t) => {
 	const { cwd, run } = fixture(t);
 	const bash = await run("bash", { command: "pwd; printf '%s' 'ok 中文'; exit 7", timeout: 15 });

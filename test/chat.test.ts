@@ -13,6 +13,7 @@ import { AgentSession } from "../src/session/agent-session.ts";
 import { BUILTIN_MODELS } from "../src/providers/catalog.ts";
 import { streamOpenAiCompletions } from "../src/providers/openai-completions.ts";
 import { SessionStore } from "../src/session/store.ts";
+import { listSlashCommands, resolveWorkflowCommand } from "../src/terminal/commands.ts";
 
 function homes(t: TestContext) {
 	const root = mkdtempSync(join(tmpdir(), "ti-chat-test-"));
@@ -27,6 +28,27 @@ function assistant(text: string, options: Partial<AssistantMessage> = {}): Assis
 const ignore = () => {};
 const messages: ModelMessage[] = [{ role: "user", content: [{ type: "text", text: "hello" }] }];
 const deepseek = BUILTIN_MODELS.find((model) => model.provider === "deepseek")!;
+
+test("workflow slash commands expand aliases, preserve arguments, and report missing required arguments", () => {
+	assert.deepEqual(resolveWorkflowCommand("/search exact text"), {
+		type: "prompt", text: "Search the project for exact text and inspect the most relevant matching files.",
+	});
+	assert.deepEqual(resolveWorkflowCommand("/t providers"), {
+		type: "prompt", text: "Run the relevant tests matching providers and report the results.",
+	});
+	assert.deepEqual(resolveWorkflowCommand("/ref"), { type: "error", text: "Usage: /ref <file>" });
+	assert.equal(resolveWorkflowCommand("/unknown"), undefined);
+	assert.match(resolveWorkflowCommand("/help")?.text ?? "", /\/commit.*别名 \/c/);
+});
+
+test("slash palette includes the built-in ODE command set and Ti commands", () => {
+	const names = new Set(listSlashCommands().map(({ name }) => name));
+	for (const name of [
+		"help", "ref", "search", "fix", "test", "build", "run", "commit", "lint", "login", "logout",
+		"format", "doc", "goal", "compact", "reload", "model", "theme", "mode", "resume", "undo", "clear", "cost",
+		"thinking", "new", "retry", "usage", "exit",
+	]) assert.ok(names.has(name), `/${name}`);
+});
 
 test("DeepSeek handles split text and a usage-only event before DONE", async (t) => {
 	const response = [
@@ -242,12 +264,14 @@ test("the CLI uses the saved key and resumes the session on restart", (t) => {
 	assert.match(first, /当前模型：deepseek\/deepseek-flash/);
 	assert.match(first, /Ti> first/);
 	assert.match(first, /输入 9 · 输出 4 · 缓存命中 2/);
+	assert.match(run("/mode\n/mode yolo\n"), /权限模式 default · ask \/ default \/ yolo[\s\S]*权限模式 yolo/);
 	const second = run("second\n/new\nthird\n/exit\n");
 	assert.match(second, /^Ti · deepseek\/deepseek-flash/);
 	assert.match(second, /Ti> first \/ first \/ second/);
 	assert.match(second, /Ti> third/);
 	const store = new SessionStore(current, [], cwd);
 	assert.deepEqual(store.list().map((session) => session.history.length).sort(), [2, 4]);
+	assert.match(run("/search example.txt\n/exit\n"), /Search the project for example\.txt and inspect the most relevant matching files\./);
 
 	const legacyStore = new SessionStore(old, [], cwd);
 	const legacy = legacyStore.create();

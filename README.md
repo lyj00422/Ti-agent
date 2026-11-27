@@ -1,6 +1,6 @@
 # Ti
 
-本地项目里的终端 coding agent。Ti 会读写文件、运行命令，根据结果继续完成任务，并把会话保存在本地。
+Ti 是一个在本地项目目录中运行的终端助手。它可以查看和修改项目文件、运行命令，并把对话保存在本地。
 
 ## 快速开始
 
@@ -13,11 +13,7 @@ npm ci --ignore-scripts
 npm start
 ```
 
-启动后：
-
-1. 输入 `/login`，保存模型供应商的 API Key。
-2. 输入 `/model`，选择模型。
-3. 输入一个任务，例如 `读 README.md，告诉我这个项目怎么启动`。
+启动后可以用 `/login` 保存 API Key，再用 `/model` 选择模型，然后直接输入任务。例如：`读 README.md，告诉我这个项目怎么启动`。
 
 也可以直接使用环境变量提供密钥，例如 `OPENAI_API_KEY`、`GEMINI_API_KEY` 或 `DEEPSEEK_API_KEY`。
 
@@ -39,19 +35,25 @@ node /path/to/Ti-agent/src/main.ts
 | `/retry` | 继续未完成的任务 |
 | `/compact` | 压缩早期对话 |
 | `/usage` | 查看用量 |
+| `/help` | 查看命令和工作流 |
 | `/exit` | 退出 |
+| `/clear` | 新建会话 |
+| `/cost` | 查看用量 |
 
-全屏终端按 `Shift+Tab` 切换思考档位，按 `Esc` 停止当前操作。
+`/` 可打开命令候选菜单。输入命令名会筛选候选，按上下键选择，按 `Tab` 补全；单独提交 `/help` 会打开命令导航页。工作流命令有 `/ref <file>`、`/search <pattern>`、`/fix [file]`、`/test [pattern]`、`/build`、`/run [args]`、`/commit [message]`、`/lint [file]`、`/format [file]` 和 `/doc [file]`。它们也支持 `/s`、`/t`、`/b`、`/r`、`/c`、`/l`、`/fmt` 和 `/d` 等短写。
+
+模型先在 `models.json`、内置目录或扩展中注册。`/login <provider>` 保存供应商的 API Key，`/model` 用来切换已注册的模型；Ti 会记住最近一次选择，并在下次启动时继续使用。全屏终端里，`Tab` 切换思考强度，`Shift+Tab` 依次切换 `ask`、`default` 和 `yolo` 权限模式，`Esc` 停止当前请求。
 
 ## 权限
 
-Ti 默认在每次工具调用前询问。输入 `y` 执行，输入 `n` 拒绝。
+Ti 默认使用 `default` 权限模式。文件读取和搜索工具会直接运行，写入与命令执行会先征求确认。`ask` 会在每次工具调用前询问，`yolo` 会直接运行所有工具。
 
 ```sh
-npm start -- --yolo
+npm start -- --permission ask
+npm start -- --permission yolo
 ```
 
-`--yolo` 会跳过确认，直接执行工具。SDK 默认也需要权限确认，只有显式设置 `permissionMode: "allow"` 才会跳过。
+也可以用 `--permission default|ask|yolo` 设置启动模式，`--yolo` 保留为 `--permission yolo` 的快捷写法。SDK 可通过 `permissionMode` 设置初始模式，默认是 `default`。
 
 ## 内置工具
 

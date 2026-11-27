@@ -33,7 +33,8 @@ async function main(): Promise<void> {
 			extension: { type: "string", short: "e", multiple: true },
 			tools: { type: "string" },
 			"mcp-config": { type: "string" },
-				yolo: { type: "boolean" },
+			yolo: { type: "boolean" },
+			permission: { type: "string" },
 		},
 	});
 	const sessionHome = resolve(process.env.TI_SESSION_HOME || join(cwd, ".ti"));
@@ -53,6 +54,10 @@ async function main(): Promise<void> {
 	const configPath = values["mcp-config"];
 	const mcpServers = await readMcpServers(configPath === undefined ? join(userHome, "mcp.json") : resolve(cwd, configPath), configPath === undefined);
 	const approvals = new ToolApprovalBroker();
+	const permissionMode = values.permission ?? (values.yolo ? "yolo" : "default");
+	if (!(permissionMode === "ask" || permissionMode === "default" || permissionMode === "yolo")) {
+		throw new Error("--permission must be ask, default or yolo.");
+	}
 	const startup = new AbortController();
 	const stopStartup = () => startup.abort();
 	process.on("SIGINT", stopStartup);
@@ -66,7 +71,7 @@ async function main(): Promise<void> {
 		stream: model.stream,
 		modelRegistry: model,
 		mcpServers,
-		permissionMode: values.yolo ? "allow" : "ask",
+		permissionMode,
 		requestApproval: approvals.request,
 		signal: startup.signal,
 		onMcpWarning: (message) => process.stderr.write(message + "\n"),
@@ -79,6 +84,11 @@ async function main(): Promise<void> {
 		const selectModel = (reference: string) => {
 			const selected = model.select(reference);
 			return `${selected.provider}/${selected.id}`;
+		};
+		const getPermissionMode = () => runtime.session.tools?.getPermissionMode() ?? permissionMode;
+		const setPermissionMode = (mode: "ask" | "default" | "yolo") => {
+			runtime.session.tools?.setPermissionMode(mode);
+			return mode;
 		};
 		if (values.mode === "rpc") {
 			await runRpcMode({
@@ -102,6 +112,8 @@ async function main(): Promise<void> {
 				getThinking: () => model.thinkingLevel,
 				thinkingLevels: model.thinkingLevels,
 				setThinking: model.setThinking,
+				getPermissionMode,
+				setPermissionMode,
 			});
 		} else {
 			throw new Error(`不支持的运行模式 ${values.mode}`);

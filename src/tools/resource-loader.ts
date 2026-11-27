@@ -16,7 +16,7 @@ export interface AgentResourceLoadOptions {
 	signal?: AbortSignal;
 	onMcpWarning?: (message: string) => void;
 	modelRegistry?: ModelRegistrationAPI;
-	permissionMode?: "ask" | "allow";
+	permissionMode?: "ask" | "default" | "yolo" | "allow";
 	requestApproval?: ToolApprovalHandler;
 }
 
